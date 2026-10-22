@@ -130,6 +130,16 @@ func ListConversations(profilePath string) ([]ConversationSummary, error) {
 		}
 	}
 
+	// Chromium stores large IndexedDB values outside LevelDB in the sibling
+	// .blob directory. The active conversation cache lives there, so scanning
+	// LevelDB records alone can return drafts but miss the conversation list.
+	for _, conv := range listConversationsFromBlobs(profilePath) {
+		existing, ok := convMap[conv.UUID]
+		if !ok || conv.UpdatedAt > existing.UpdatedAt {
+			convMap[conv.UUID] = conv
+		}
+	}
+
 	var list []ConversationSummary
 	for _, item := range convMap {
 		list = append(list, item)

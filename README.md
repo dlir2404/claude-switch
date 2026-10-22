@@ -161,6 +161,8 @@ claude-switch doctor            # Kiểm tra symlink, quyền extension
 claude-switch menu              # Bật icon trên thanh Menu Bar macOS
 ```
 
+Trong menu của icon `✻`, chọn **LLM Settings…** để bật/tắt tóm tắt LLM, cấu hình Base URL/model/timeout, nhập hoặc xóa API key, và kiểm tra kết nối. API key nhập trong cửa sổ được gửi qua stdin tới CLI, không đưa vào arguments của process; file config được lưu với quyền chỉ owner đọc/ghi.
+
 ---
 
 ## 5. Cài đặt & Build

@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -81,6 +82,7 @@ Sử dụng:
   claude-switch list [--json]   Xem danh sách các tài khoản (* = đang dùng)
   claude-switch current         Xem tài khoản hiện tại
   claude-switch handoff         Trích xuất bối cảnh phiên chat hiện tại ra Markdown
+  claude-switch handoff conversations --json  Liệt kê hội thoại profile hiện tại
   claude-switch handoff copy    Sao chép lại câu lệnh chỉ dẫn handoff vào clipboard
   claude-switch handoff open    Mở file snapshot handoff gần nhất
   claude-switch handoff list    Xem danh sách các bản snapshot handoff
@@ -261,7 +263,12 @@ func handleUse(args []string) {
 
 	doHandoff := hasFlag(args, "-h") || hasFlag(args, "--handoff")
 	useLatest := hasFlag(args, "--latest")
+	conversationUUID := flagValue(args, "--conversation")
 	allowWithoutHandoff := hasFlag(args, "--allow-switch-without-handoff")
+	if conversationUUID != "" && !doHandoff {
+		fmt.Println("Lỗi: --conversation chỉ dùng cùng -h/--handoff.")
+		os.Exit(2)
+	}
 
 	targetProfile, err := profile.ResolveProfile(targetQuery)
 	if err != nil {
@@ -287,7 +294,7 @@ func handleUse(args []string) {
 
 	var handoffPath string
 	if doHandoff && currentProfile != nil && currentProfile.Name != targetProfile.Name {
-		result, err := executeHandoffFlow(currentProfile, targetProfile, useLatest, force, allowWithoutHandoff)
+		result, err := executeHandoffFlow(currentProfile, targetProfile, useLatest, conversationUUID, force, allowWithoutHandoff)
 		if err != nil {
 			fmt.Printf("Lỗi Handoff: %v\n", err)
 			os.Exit(1)
@@ -347,7 +354,7 @@ func handleRecover() {
 	fmt.Println("✓ Đã phục hồi thành công!")
 }
 
-func executeHandoffFlow(currentProfile, targetProfile *profile.ProfileItem, useLatest, force, allowWithoutHandoff bool) (*handoff.HandoffResult, error) {
+func executeHandoffFlow(currentProfile, targetProfile *profile.ProfileItem, useLatest bool, conversationUUID string, force, allowWithoutHandoff bool) (*handoff.HandoffResult, error) {
 	fmt.Println("Đang kiểm tra dữ liệu hội thoại trong tài khoản hiện tại...")
 	convs, err := extractor.ListConversations(currentProfile.Path)
 	if err != nil || len(convs) == 0 {
@@ -359,7 +366,17 @@ func executeHandoffFlow(currentProfile, targetProfile *profile.ProfileItem, useL
 	}
 
 	var chosen *extractor.ConversationSummary
-	if useLatest {
+	if conversationUUID != "" {
+		for i := range convs {
+			if convs[i].UUID == conversationUUID {
+				chosen = &convs[i]
+				break
+			}
+		}
+		if chosen == nil {
+			return nil, fmt.Errorf("không tìm thấy hội thoại đã chọn trong profile hiện tại; hãy mở lại menu và chọn lại")
+		}
+	} else if useLatest {
 		chosen = &convs[0]
 	} else {
 		picked, ok := ui.PickConversation(convs)
@@ -428,11 +445,53 @@ func executeHandoffFlow(currentProfile, targetProfile *profile.ProfileItem, useL
 	return res, nil
 }
 
+func handleHandoffConversations(args []string) {
+	if !hasFlag(args, "--json") {
+		fmt.Fprintln(os.Stderr, "Cú pháp: claude-switch handoff conversations --json")
+		os.Exit(2)
+	}
+	activeName := profile.GetActiveProfileName()
+	if activeName == "" {
+		fmt.Fprintln(os.Stderr, "Chưa có profile nào đang hoạt động.")
+		os.Exit(1)
+	}
+	activeProfile, err := profile.ResolveProfile(activeName)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Không thể xác định profile hiện tại: %v\n", err)
+		os.Exit(1)
+	}
+	conversations, err := extractor.ListConversations(activeProfile.Path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Không thể liệt kê hội thoại: %v\n", err)
+		os.Exit(1)
+	}
+	if len(conversations) == 0 {
+		fmt.Fprintln(os.Stderr, "Không tìm thấy hội thoại trong profile hiện tại.")
+		os.Exit(1)
+	}
+	if err := json.NewEncoder(os.Stdout).Encode(conversations); err != nil {
+		fmt.Fprintf(os.Stderr, "Không thể xuất danh sách hội thoại: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func flagValue(args []string, flag string) string {
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == flag {
+			return args[i+1]
+		}
+	}
+	return ""
+}
+
 func handleHandoff(args []string) {
 	if len(args) > 0 {
 		sub := args[0]
 		subArgs := args[1:]
 		switch sub {
+		case "conversations":
+			handleHandoffConversations(subArgs)
+			return
 		case "list", "ls":
 			handleHandoffList(subArgs)
 			return
@@ -494,7 +553,8 @@ func handleHandoff(args []string) {
 	}
 	useLatest := hasFlag(args, "--latest")
 	force := hasFlag(args, "--force")
-	res, err := executeHandoffFlow(p, p, useLatest, force, false)
+	conversationUUID := flagValue(args, "--conversation")
+	res, err := executeHandoffFlow(p, p, useLatest, conversationUUID, force, false)
 	if err != nil {
 		fmt.Printf("Lỗi: %v\n", err)
 		os.Exit(1)
@@ -635,7 +695,7 @@ func handleRenameByEmail() {
 }
 
 func handleConfig(args []string) {
-	cfg, _ := config.LoadConfig()
+	cfg, loadErr := config.LoadConfig()
 	if len(args) == 0 {
 		// Print current config
 		maskedKey := "chưa thiết lập"
@@ -663,6 +723,70 @@ func handleConfig(args []string) {
 
 	sub := args[0]
 	switch sub {
+	case "json":
+		apiKeyConfigured := cfg.GetResolvedAPIKey() != ""
+		view := struct {
+			Enabled        bool   `json:"enabled"`
+			Provider       string `json:"provider"`
+			BaseURL        string `json:"base_url"`
+			Model          string `json:"model"`
+			TimeoutSeconds int    `json:"timeout_seconds"`
+			HasAPIKey      bool   `json:"has_api_key"`
+		}{cfg.LLM.Enabled, cfg.LLM.Provider, cfg.LLM.BaseURL, cfg.LLM.Model, cfg.LLM.TimeoutSeconds, apiKeyConfigured}
+		if err := json.NewEncoder(os.Stdout).Encode(view); err != nil {
+			fmt.Fprintf(os.Stderr, "Lỗi khi xuất cấu hình: %v\n", err)
+			os.Exit(1)
+		}
+	case "update":
+		if loadErr != nil {
+			fmt.Fprintf(os.Stderr, "Không thể đọc cấu hình hiện tại: %v\n", loadErr)
+			os.Exit(1)
+		}
+		var update struct {
+			Enabled        *bool   `json:"enabled"`
+			BaseURL        *string `json:"base_url"`
+			Model          *string `json:"model"`
+			APIKey         *string `json:"api_key"`
+			ClearAPIKey    bool    `json:"clear_api_key"`
+			TimeoutSeconds *int    `json:"timeout_seconds"`
+		}
+		decoder := json.NewDecoder(io.LimitReader(os.Stdin, 64*1024))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&update); err != nil {
+			fmt.Fprintf(os.Stderr, "JSON cấu hình không hợp lệ: %v\n", err)
+			os.Exit(1)
+		}
+		if update.APIKey != nil && update.ClearAPIKey {
+			fmt.Fprintln(os.Stderr, "Không thể vừa đặt vừa xóa API key trong cùng một lần cập nhật.")
+			os.Exit(1)
+		}
+		if update.Enabled != nil {
+			cfg.LLM.Enabled = *update.Enabled
+		}
+		if update.BaseURL != nil {
+			cfg.LLM.BaseURL = strings.TrimSpace(*update.BaseURL)
+		}
+		if update.Model != nil {
+			cfg.LLM.Model = strings.TrimSpace(*update.Model)
+		}
+		if update.APIKey != nil {
+			cfg.LLM.APIKey = *update.APIKey
+		}
+		if update.ClearAPIKey {
+			cfg.LLM.APIKey = ""
+		}
+		if update.TimeoutSeconds != nil {
+			if *update.TimeoutSeconds < 1 || *update.TimeoutSeconds > 600 {
+				fmt.Fprintln(os.Stderr, "Timeout phải nằm trong khoảng 1–600 giây.")
+				os.Exit(1)
+			}
+			cfg.LLM.TimeoutSeconds = *update.TimeoutSeconds
+		}
+		if err := config.SaveConfig(cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "Không thể lưu cấu hình: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("Đã lưu cấu hình LLM.")
 	case "test":
 		fmt.Printf("Đang kiểm tra kết nối tới LLM endpoint (%s, model: %s)...\n", cfg.LLM.BaseURL, cfg.LLM.Model)
 		dur, err := llm.PingTest(cfg)
@@ -694,8 +818,15 @@ func handleConfig(args []string) {
 			fmt.Printf("Lỗi: Thuộc tính '%s' không được hỗ trợ.\n", key)
 			return
 		}
-		_ = config.SaveConfig(cfg)
-		fmt.Printf("Đã lưu %s = %s\n", key, val)
+		if err := config.SaveConfig(cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "Không thể lưu cấu hình: %v\n", err)
+			os.Exit(1)
+		}
+		if key == "llm.api_key" {
+			fmt.Println("Đã lưu llm.api_key = [đã ẩn]")
+		} else {
+			fmt.Printf("Đã lưu %s = %s\n", key, val)
+		}
 	}
 }
 
