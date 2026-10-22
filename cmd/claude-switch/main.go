@@ -728,11 +728,10 @@ func handleDoctor() {
 }
 
 func handleMenu(args []string) {
-	barAppPath := filepath.Join(filepath.Dir(os.Args[0]), "claude-switch-bar")
-	if _, err := os.Stat(barAppPath); os.IsNotExist(err) {
-		// Check in ~/.local/bin or current directory
-		home, _ := os.UserHomeDir()
-		barAppPath = filepath.Join(home, ".local", "bin", "claude-switch-bar")
+	barAppPath := resolveMenuBarExecutable()
+	if barAppPath == "" {
+		fmt.Fprintln(os.Stderr, "Không tìm thấy Claude Switch Menu Bar app. Hãy build và cài bằng `make install`.")
+		os.Exit(1)
 	}
 
 	if hasFlag(args, "--install") {
@@ -744,11 +743,39 @@ func handleMenu(args []string) {
 
 	fmt.Println("Đang khởi động Menu Bar Header App...")
 	cmd := exec.Command(barAppPath)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
 		fmt.Printf("Lỗi khi mở Menu Bar App: %v\n", err)
 	} else {
-		fmt.Println("✓ Icon Claude đã xuất hiện trên thanh Menu Bar desktop!")
+		fmt.Println("✓ Đã gửi lệnh khởi chạy Menu Bar app.")
 	}
+}
+
+func resolveMenuBarExecutable() string {
+	home, _ := os.UserHomeDir()
+	var prefixes []string
+	if exe, err := os.Executable(); err == nil {
+		prefixes = append(prefixes, filepath.Dir(exe))
+	}
+	if home != "" {
+		prefixes = append(prefixes, filepath.Join(home, ".local", "bin"))
+	}
+	prefixes = append(prefixes, ".")
+
+	for _, prefix := range prefixes {
+		candidates := []string{
+			filepath.Join(prefix, "claude-switch-bar.app", "Contents", "MacOS", "claude-switch-bar"),
+			filepath.Join(prefix, "claude-switch-bar"), // Compatibility with older standalone builds.
+		}
+		for _, candidate := range candidates {
+			info, err := os.Stat(candidate)
+			if err == nil && !info.IsDir() {
+				return candidate
+			}
+		}
+	}
+	return ""
 }
 
 func installLaunchAgent(barAppPath string) {
