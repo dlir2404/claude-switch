@@ -143,6 +143,15 @@ claude-switch handoff prune     # Chạy dọn dẹp các snapshot cũ theo cấ
 claude-switch handoff pin <file> # Ghim snapshot quan trọng không cho tự động xóa
 ```
 
+### Kiểm tra và dọn cache Claude Desktop:
+```bash
+claude-switch storage                    # Xem tổng dung lượng và các thư mục lớn theo profile
+claude-switch storage clean --dry-run    # Xem trước cache có thể tạo lại, chưa xóa gì
+claude-switch storage clean --yes        # Xóa cache sau khi đã đóng Claude Desktop
+```
+
+Lệnh dọn chỉ nhắm vào cache Chromium/Electron có thể tạo lại (Cache, Code Cache, GPUCache và cache đồ họa). Nó giữ nguyên Cookies, config đăng nhập, IndexedDB, Local Storage, dữ liệu hội thoại, Claude Extensions và Crashpad reports. Claude Desktop phải được đóng hoàn toàn trước khi xóa.
+
 ### Các lệnh quản trị khác:
 ```bash
 claude-switch add               # Thêm tài khoản mới (đăng nhập -> tự lưu email)

@@ -28,17 +28,51 @@ func slugify(s string) string {
 	return s
 }
 
-func CreateHandoff(cfg *config.Config, detail *extractor.ConversationDetail, fromAccount string) (string, error) {
+var snapshotFileRegex = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}_\d{4,6}_.*\.md$`)
+
+func tightenHandoffPermissions(dir string) {
+	// Only chmod the directory itself if it is the dedicated ~/.claude-switch/handoffs directory
+	if filepath.Clean(dir) == filepath.Clean(config.GetHandoffsDir()) {
+		_ = os.Chmod(dir, 0700)
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		// Only touch files matching claude-switch snapshot format (never touch user's other documents)
+		if snapshotFileRegex.MatchString(e.Name()) && e.Name() != "latest.md" {
+			filePath := filepath.Join(dir, e.Name())
+			fi, err := os.Lstat(filePath)
+			if err != nil {
+				continue
+			}
+			// Only chmod regular files; skip any symlinks to prevent following to external targets
+			if fi.Mode().IsRegular() {
+				_ = os.Chmod(filePath, 0600)
+			}
+		}
+	}
+}
+
+func CreateHandoff(cfg *config.Config, detail *extractor.ConversationDetail, fromAccount string) (*HandoffResult, error) {
 	handoffsDir := cfg.Handoff.SaveDir
 	if handoffsDir == "" {
 		handoffsDir = config.GetHandoffsDir()
 	}
-	if err := os.MkdirAll(handoffsDir, 0755); err != nil {
-		return "", fmt.Errorf("failed to create handoffs dir: %w", err)
+	if err := os.MkdirAll(handoffsDir, 0700); err != nil {
+		return nil, fmt.Errorf("failed to create handoffs dir: %w", err)
 	}
+	tightenHandoffPermissions(handoffsDir)
+
+	now := time.Now()
+	timestampStr := now.Format("2006-01-02_150405")
+	slug := slugify(detail.Summary.Title)
+	snapshotID := fmt.Sprintf("%s_%s", timestampStr, slug)
 
 	var markdownContent string
-	var genErr error
+	generatorType := "rule_based"
 
 	// Try LLM generation if enabled
 	if cfg.LLM.Enabled {
@@ -46,58 +80,135 @@ func CreateHandoff(cfg *config.Config, detail *extractor.ConversationDetail, fro
 		summary, err := llm.GenerateHandoffSummary(cfg, prompt)
 		if err == nil && strings.TrimSpace(summary) != "" {
 			markdownContent = summary
-		} else {
-			genErr = err
+			generatorType = "llm"
 		}
 	}
 
 	// Fallback to Rule-based if LLM was disabled or failed
 	if markdownContent == "" {
 		markdownContent = GenerateRuleBasedMarkdown(cfg, detail, fromAccount)
-		if genErr != nil {
-			markdownContent = fmt.Sprintf("<!-- Note: LLM summary fallback (%v) -->\n\n%s", genErr, markdownContent)
+		if cfg.LLM.Enabled {
+			generatorType = "rule_based_fallback"
 		}
 	}
 
-	// Create snapshot file
-	now := time.Now()
-	timestampStr := now.Format("2006-01-02_150405")
-	slug := slugify(detail.Summary.Title)
-	filename := fmt.Sprintf("%s_%s.md", timestampStr, slug)
-	snapshotPath := filepath.Join(handoffsDir, filename)
+	// Prepend clean metadata header
+	metaHeader := fmt.Sprintf(`<!--
+snapshot_id: %s
+timestamp: %s
+source_account: %s
+conversation_uuid: %s
+title: %s
+model: %s
+generator: %s
+-->
 
-	if _, err := os.Stat(snapshotPath); err == nil {
-		for i := 1; i <= 99; i++ {
-			altName := fmt.Sprintf("%s_%s_%d.md", timestampStr, slug, i)
-			altPath := filepath.Join(handoffsDir, altName)
-			if _, err := os.Stat(altPath); os.IsNotExist(err) {
-				snapshotPath = altPath
-				break
-			}
+`, snapshotID, now.Format(time.RFC3339), fromAccount, detail.Summary.UUID, detail.Summary.Title, detail.Summary.Model, generatorType)
+
+	finalContent := metaHeader + markdownContent
+	contentBytes := []byte(finalContent)
+
+	// 1. Create a unique hidden temporary file in the same directory with mode 0600
+	tempName := fmt.Sprintf(".snapshot-%s-%d.tmp", snapshotID, time.Now().UnixNano())
+	tempPath := filepath.Join(handoffsDir, tempName)
+	tmpFile, err := os.OpenFile(tempPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		return nil, fmt.Errorf("không thể tạo file snapshot tạm: %w", err)
+	}
+
+	committed := false
+	defer func() {
+		if !committed {
+			_ = os.Remove(tempPath)
+		}
+	}()
+
+	// 2. Write full content, verify byte count, Sync, and Close before publishing
+	n, err := tmpFile.Write(contentBytes)
+	if err != nil {
+		_ = tmpFile.Close()
+		return nil, fmt.Errorf("không thể ghi nội dung snapshot: %w", err)
+	}
+	if n != len(contentBytes) {
+		_ = tmpFile.Close()
+		return nil, fmt.Errorf("ghi nội dung snapshot không trọn vẹn: ghi %d/%d bytes", n, len(contentBytes))
+	}
+	if err := tmpFile.Sync(); err != nil {
+		_ = tmpFile.Close()
+		return nil, fmt.Errorf("không thể sync snapshot tạm: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		return nil, fmt.Errorf("không thể đóng snapshot tạm: %w", err)
+	}
+
+	// 3. Atomically publish to final destination using hard link (atomic no-replace)
+	var snapshotPath string
+	for i := 0; i <= 999; i++ {
+		var name string
+		if i == 0 {
+			name = fmt.Sprintf("%s.md", snapshotID)
+		} else {
+			name = fmt.Sprintf("%s_%d.md", snapshotID, i)
+		}
+		candPath := filepath.Join(handoffsDir, name)
+		if err := os.Link(tempPath, candPath); err == nil {
+			snapshotPath = candPath
+			committed = true
+			_ = os.Remove(tempPath)
+			break
+		} else if !os.IsExist(err) {
+			return nil, fmt.Errorf("lỗi khi liên kết snapshot vào đích %s: %w", candPath, err)
 		}
 	}
 
-	if err := os.WriteFile(snapshotPath, []byte(markdownContent), 0644); err != nil {
-		return "", fmt.Errorf("failed to write snapshot file: %w", err)
+	if snapshotPath == "" {
+		return nil, fmt.Errorf("không thể cấp phát tên snapshot duy nhất cho %s sau 1000 lần thử", snapshotID)
 	}
 
-	// Update latest.md symlink
+	// 4. Verification: confirm final file exists, is regular, and size matches exactly
+	info, err := os.Stat(snapshotPath)
+	if err != nil || info.Size() != int64(len(contentBytes)) {
+		return nil, fmt.Errorf("snapshot verification failed: file is missing or size mismatch")
+	}
+
+	// 5. Atomic symlink for latest.md with strict verification
 	latestLink := filepath.Join(handoffsDir, "latest.md")
-	_ = os.Remove(latestLink)
-	if err := os.Symlink(snapshotPath, latestLink); err != nil {
-		return "", fmt.Errorf("failed to create latest symlink: %w", err)
+	tmpLink := filepath.Join(handoffsDir, fmt.Sprintf(".latest.tmp.%d", time.Now().UnixNano()))
+	_ = os.Remove(tmpLink)
+	if err := os.Symlink(snapshotPath, tmpLink); err != nil {
+		return nil, fmt.Errorf("không thể tạo symlink tạm cho latest.md: %w", err)
+	}
+	if err := os.Rename(tmpLink, latestLink); err != nil {
+		_ = os.Remove(tmpLink)
+		return nil, fmt.Errorf("không thể cập nhật symlink latest.md: %w", err)
+	}
+	targetStat, err := os.Stat(latestLink)
+	if err != nil || targetStat.Size() == 0 {
+		return nil, fmt.Errorf("xác minh symlink latest.md thất bại: không trỏ tới file hợp lệ: %v", err)
 	}
 
-	// Set macOS clipboard directive
+	// 6. Set clipboard directive
 	directive := BuildDirective(latestLink)
-	_ = SetClipboard(directive)
+	clipboardErr := SetClipboard(directive)
 
 	// Trigger background pruning
 	go func() {
 		_, _ = PruneHandoffs(handoffsDir, &cfg.Handoff.Pruning, false)
 	}()
 
-	return snapshotPath, nil
+	res := &HandoffResult{
+		Status:       StatusSuccess,
+		SnapshotPath: snapshotPath,
+		Title:        detail.Summary.Title,
+		Directive:    directive,
+	}
+
+	if clipboardErr != nil {
+		res.Status = StatusClipboardFailed
+		res.Error = fmt.Sprintf("failed to update clipboard: %v", clipboardErr)
+	}
+
+	return res, nil
 }
 
 func buildLLMPrompt(cfg *config.Config, detail *extractor.ConversationDetail, fromAccount string) string {

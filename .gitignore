@@ -1,11 +1,14 @@
 # Binaries
 bin/
 
-# Architecture planning & issues
+# Architecture planning, issues & internal checklists
 PLAN.md
+*PLAN*.md
 *.plan
 issues.md
 *issue*.md
+CHECKLIST.md
+*CHECKLIST*.md
 
 # OS files
 .DS_Store

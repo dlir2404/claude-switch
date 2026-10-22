@@ -15,6 +15,7 @@ import (
 	"claude-switch/pkg/handoff"
 	"claude-switch/pkg/llm"
 	"claude-switch/pkg/profile"
+	"claude-switch/pkg/storage"
 	"claude-switch/pkg/ui"
 )
 
@@ -50,6 +51,10 @@ func main() {
 		handleConfig(args)
 	case "doctor":
 		handleDoctor()
+	case "recover":
+		handleRecover()
+	case "storage":
+		handleStorage(args)
 	case "menu":
 		handleMenu(args)
 	case "-v", "--version", "version":
@@ -76,6 +81,8 @@ Sử dụng:
   claude-switch list [--json]   Xem danh sách các tài khoản (* = đang dùng)
   claude-switch current         Xem tài khoản hiện tại
   claude-switch handoff         Trích xuất bối cảnh phiên chat hiện tại ra Markdown
+  claude-switch handoff copy    Sao chép lại câu lệnh chỉ dẫn handoff vào clipboard
+  claude-switch handoff open    Mở file snapshot handoff gần nhất
   claude-switch handoff list    Xem danh sách các bản snapshot handoff
   claude-switch handoff prune   Dọn dẹp các snapshot cũ theo cấu hình retention
   claude-switch handoff pin <f> Ghim snapshot quan trọng không cho tự động dọn dẹp
@@ -84,13 +91,72 @@ Sử dụng:
   claude-switch rename-by-email Quét và đổi tên thư mục các profile cũ theo email
   claude-switch config          Xem hoặc sửa cấu hình LLM / Handoff
   claude-switch doctor          Kiểm tra symlink, quyền extension và trạng thái app
+  claude-switch recover         Khôi phục phiên chuyển đổi nếu bị gián đoạn giữa chừng
+  claude-switch storage         Xem dung lượng profile và cache có thể dọn
+  claude-switch storage clean   Xem trước cache có thể dọn; thêm --yes để xóa
   claude-switch menu            Bật icon menu bar trên header desktop macOS
 
 Tùy chọn chung:
   -h, --handoff     Bật menu chọn đoạn chat để chuyển context trước khi đổi tài khoản
   --latest          Tự động lấy đoạn chat mới nhất mà không hiển thị menu chọn
   --force           Buộc tắt Claude Desktop nếu app không phản hồi
+  --allow-switch-without-handoff  Cho phép switch tiếp ngay cả khi tạo handoff thất bại
 `)
+}
+
+func handleStorage(args []string) {
+	if len(args) > 0 && args[0] == "clean" {
+		clean := storage.CleanCandidates(config.GetProfilesDir())
+		if len(clean) == 0 {
+			fmt.Println("Không tìm thấy cache có thể dọn.")
+			return
+		}
+
+		if !hasFlag(args[1:], "--yes") {
+			fmt.Println("Xem trước cache có thể tạo lại (chưa xóa gì):")
+			for _, item := range clean {
+				fmt.Printf("  %s / %s  %s\n", item.Profile, item.Name, storage.FormatBytes(item.Bytes))
+			}
+			fmt.Printf("Có thể giải phóng khoảng %s. Chạy `claude-switch storage clean --yes` để xóa sau khi đã đóng Claude.\n", storage.FormatBytes(storage.TotalCandidateBytes(clean)))
+			return
+		}
+
+		if profile.IsRunning() {
+			fmt.Println("Lỗi: Hãy đóng Claude Desktop hoàn toàn trước khi dọn cache.")
+			os.Exit(1)
+		}
+		removed, freed, err := storage.Clean(config.GetProfilesDir())
+		for _, path := range removed {
+			fmt.Printf("Đã dọn: %s\n", path)
+		}
+		if err != nil {
+			fmt.Printf("Lỗi khi dọn cache: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Đã dọn %s cache, giải phóng khoảng %s.\n", strconv.Itoa(len(removed)), storage.FormatBytes(freed))
+		return
+	}
+
+	reports, err := storage.Scan(config.GetProfilesDir())
+	if err != nil {
+		fmt.Printf("Lỗi khi đọc dung lượng profile: %v\n", err)
+		os.Exit(1)
+	}
+	if len(reports) == 0 {
+		fmt.Println("Chưa có profile nào.")
+		return
+	}
+	fmt.Println("=== DUNG LƯỢNG CLAUDE PROFILES ===")
+	var grandTotal, cacheTotal int64
+	for _, report := range reports {
+		grandTotal += report.TotalBytes
+		cacheTotal += report.CacheBytes
+		fmt.Printf("%s  tổng %s, cache %s\n", report.Name, storage.FormatBytes(report.TotalBytes), storage.FormatBytes(report.CacheBytes))
+		for _, dir := range report.Largest {
+			fmt.Printf("  %-32s %s\n", dir.Name, storage.FormatBytes(dir.Bytes))
+		}
+	}
+	fmt.Printf("Tổng: %s; cache có thể dọn: khoảng %s\n", storage.FormatBytes(grandTotal), storage.FormatBytes(cacheTotal))
 }
 
 func handleList(args []string) {
@@ -186,8 +252,16 @@ func handleUse(args []string) {
 		return
 	}
 
+	lock, err := profile.AcquireSwitchLock()
+	if err != nil {
+		fmt.Printf("Lỗi: %v\n", err)
+		os.Exit(1)
+	}
+	defer lock.Release()
+
 	doHandoff := hasFlag(args, "-h") || hasFlag(args, "--handoff")
 	useLatest := hasFlag(args, "--latest")
+	allowWithoutHandoff := hasFlag(args, "--allow-switch-without-handoff")
 
 	targetProfile, err := profile.ResolveProfile(targetQuery)
 	if err != nil {
@@ -201,22 +275,87 @@ func handleUse(args []string) {
 		currentProfile, _ = profile.ResolveProfile(activeName)
 	}
 
+	opID := fmt.Sprintf("op_%d", time.Now().Unix())
+	sourceName := ""
+	if currentProfile != nil {
+		sourceName = currentProfile.Name
+	}
+	if err := profile.RecordJournalStep(opID, sourceName, targetProfile.Name, "", profile.StepStarted); err != nil {
+		fmt.Printf("Lỗi ghi journal: %v\n", err)
+		os.Exit(1)
+	}
+
+	var handoffPath string
 	if doHandoff && currentProfile != nil && currentProfile.Name != targetProfile.Name {
-		executeHandoffFlow(currentProfile, useLatest)
+		result, err := executeHandoffFlow(currentProfile, targetProfile, useLatest, force, allowWithoutHandoff)
+		if err != nil {
+			fmt.Printf("Lỗi Handoff: %v\n", err)
+			os.Exit(1)
+		}
+		if result != nil && result.SnapshotPath != "" {
+			handoffPath = result.SnapshotPath
+			if err := profile.RecordJournalStep(opID, sourceName, targetProfile.Name, handoffPath, profile.StepHandoffDone); err != nil {
+				fmt.Printf("Lỗi ghi journal: %v\n", err)
+				os.Exit(1)
+			}
+		}
 	}
 
 	if err := profile.SwitchToProfile(targetProfile, force); err != nil {
 		fmt.Printf("Lỗi: %v\n", err)
 		os.Exit(1)
 	}
+
+	if err := profile.RecordJournalStep(opID, sourceName, targetProfile.Name, handoffPath, profile.StepSymlinkUpdated); err != nil {
+		fmt.Printf("Lỗi ghi journal: %v\n", err)
+		os.Exit(1)
+	}
+
+	if profile.GetActiveProfileName() != targetProfile.Name {
+		fmt.Printf("⚠️  Cảnh báo: Symlink chưa trỏ đúng về profile đích %s\n", targetProfile.Name)
+	} else {
+		_ = profile.RecordJournalStep(opID, sourceName, targetProfile.Name, handoffPath, profile.StepVerified)
+		profile.ClearJournal()
+	}
 }
 
-func executeHandoffFlow(currentProfile *profile.ProfileItem, useLatest bool) {
+func handleRecover() {
+	lock, err := profile.AcquireSwitchLock()
+	if err != nil {
+		fmt.Printf("Lỗi: %v\n", err)
+		os.Exit(1)
+	}
+	defer lock.Release()
+
+	j, err := profile.ReadJournal()
+	if err != nil || j == nil {
+		fmt.Println("Không có phiên chuyển đổi nào bị dở dang cần phục hồi.")
+		return
+	}
+	fmt.Printf("Phát hiện phiên chuyển đổi chưa hoàn tất: %s (%s -> %s, bước: %s)\n", j.OperationID, j.Source, j.Target, j.Step)
+	targetProfile, err := profile.ResolveProfile(j.Target)
+	if err != nil {
+		fmt.Printf("Lỗi: Không tìm thấy profile đích '%s': %v\n", j.Target, err)
+		return
+	}
+	fmt.Printf("Đang hoàn tất chuyển đổi sang profile '%s'...\n", targetProfile.Name)
+	if err := profile.SwitchToProfile(targetProfile, true); err != nil {
+		fmt.Printf("Lỗi phục hồi: %v\n", err)
+		return
+	}
+	profile.ClearJournal()
+	fmt.Println("✓ Đã phục hồi thành công!")
+}
+
+func executeHandoffFlow(currentProfile, targetProfile *profile.ProfileItem, useLatest, force, allowWithoutHandoff bool) (*handoff.HandoffResult, error) {
 	fmt.Println("Đang kiểm tra dữ liệu hội thoại trong tài khoản hiện tại...")
 	convs, err := extractor.ListConversations(currentProfile.Path)
 	if err != nil || len(convs) == 0 {
-		fmt.Println("Không tìm thấy hội thoại nào gần đây để handoff. Tiếp tục switch bình thường...")
-		return
+		if allowWithoutHandoff {
+			fmt.Println("Cảnh báo: Không tìm thấy hội thoại để handoff. Tiếp tục switch do có cờ --allow-switch-without-handoff.")
+			return &handoff.HandoffResult{Status: handoff.StatusSkipped}, nil
+		}
+		return nil, fmt.Errorf("không tìm thấy hội thoại nào gần đây để handoff. Đã hủy chuyển tài khoản để bảo toàn dữ liệu (thêm --allow-switch-without-handoff nếu muốn bỏ qua)")
 	}
 
 	var chosen *extractor.ConversationSummary
@@ -225,17 +364,42 @@ func executeHandoffFlow(currentProfile *profile.ProfileItem, useLatest bool) {
 	} else {
 		picked, ok := ui.PickConversation(convs)
 		if !ok || picked == nil {
-			fmt.Println("Bỏ qua handoff context.")
-			return
+			fmt.Println("Người dùng đã chọn bỏ qua handoff. Tiếp tục chuyển tài khoản...")
+			return &handoff.HandoffResult{Status: handoff.StatusSkipped}, nil
 		}
 		chosen = picked
+	}
+
+	// Now close Claude Desktop before reading and writing DB
+	wasRunning := profile.IsRunning()
+	if wasRunning {
+		fmt.Println("Đang đóng Claude Desktop để đồng bộ trạng thái database...")
+		if err := profile.QuitApp(force); err != nil {
+			if allowWithoutHandoff {
+				fmt.Printf("Cảnh báo: Không thể đóng Claude Desktop (%v). Bỏ qua handoff và tiếp tục switch do có cờ --allow-switch-without-handoff.\n", err)
+				return &handoff.HandoffResult{Status: handoff.StatusSkipped}, nil
+			} else {
+				return nil, fmt.Errorf("không thể đóng Claude Desktop trước khi đọc database: %w. Đã hủy chuyển tài khoản", err)
+			}
+		}
+	}
+
+	// For standalone handoff (target is current profile), reopen Claude if it was running
+	if currentProfile.Name == targetProfile.Name && wasRunning {
+		defer func() {
+			fmt.Println("Đang mở lại Claude Desktop...")
+			_ = exec.Command("open", "-a", "Claude").Run()
+		}()
 	}
 
 	fmt.Printf("Đang trích xuất và tạo Handoff cho: '%s'...\n", chosen.Title)
 	detail, err := extractor.GetConversationDetail(currentProfile.Path, chosen.UUID)
 	if err != nil {
-		fmt.Printf("Lỗi khi trích xuất hội thoại: %v\n", err)
-		return
+		if allowWithoutHandoff {
+			fmt.Printf("Cảnh báo: Trích xuất hội thoại thất bại (%v). Tiếp tục switch do có cờ --allow-switch-without-handoff.\n", err)
+			return &handoff.HandoffResult{Status: handoff.StatusExtractionFailed, Error: err.Error()}, nil
+		}
+		return nil, fmt.Errorf("trích xuất hội thoại thất bại: %w. Đã hủy chuyển tài khoản để bảo toàn dữ liệu", err)
 	}
 
 	cfg, _ := config.LoadConfig()
@@ -244,15 +408,24 @@ func executeHandoffFlow(currentProfile *profile.ProfileItem, useLatest bool) {
 		fromAccount = currentProfile.AccountInfo.Email
 	}
 
-	snapshotPath, err := handoff.CreateHandoff(cfg, detail, fromAccount)
+	res, err := handoff.CreateHandoff(cfg, detail, fromAccount)
 	if err != nil {
-		fmt.Printf("Lỗi khi tạo handoff file: %v\n", err)
-		return
+		if allowWithoutHandoff {
+			fmt.Printf("Cảnh báo: Tạo file handoff thất bại (%v). Tiếp tục switch do có cờ --allow-switch-without-handoff.\n", err)
+			return &handoff.HandoffResult{Status: handoff.StatusWriteFailed, Error: err.Error()}, nil
+		}
+		return nil, fmt.Errorf("tạo gói handoff thất bại: %w. Đã hủy chuyển tài khoản để bảo vệ bối cảnh", err)
 	}
 
-	fmt.Printf("✓ Đã tạo snapshot: %s\n", snapshotPath)
-	fmt.Println("✓ Đã cập nhật symlink latest.md và copy câu lệnh chỉ dẫn vào Clipboard!")
-	fmt.Println("  (Sau khi Claude mở lên, bạn chỉ cần nhấn Cmd+V và Enter).")
+	fmt.Printf("✓ Đã tạo snapshot handoff: %s\n", res.SnapshotPath)
+	if res.Status == handoff.StatusClipboardFailed {
+		fmt.Println("⚠️  Lưu ý: Không thể ghi vào Clipboard macOS. Bạn có thể xem file trực tiếp hoặc chạy `claude-switch handoff copy`.")
+	} else {
+		fmt.Println("✓ Đã cập nhật symlink latest.md và copy câu lệnh chỉ dẫn vào Clipboard!")
+		fmt.Println("  (Sau khi Claude mở lên, bạn chỉ cần nhấn Cmd+V và Enter).")
+	}
+
+	return res, nil
 }
 
 func handleHandoff(args []string) {
@@ -282,21 +455,60 @@ func handleHandoff(args []string) {
 			_ = handoff.UnpinHandoff(config.GetHandoffsDir(), subArgs[0])
 			fmt.Printf("Đã bỏ ghim: %s\n", subArgs[0])
 			return
+		case "copy":
+			latestLink := filepath.Join(config.GetHandoffsDir(), "latest.md")
+			if _, err := os.Stat(latestLink); err != nil {
+				fmt.Println("Lỗi: Chưa có bản snapshot handoff nào.")
+				return
+			}
+			directive := handoff.BuildDirective(latestLink)
+			if err := handoff.SetClipboard(directive); err != nil {
+				fmt.Printf("Lỗi khi ghi vào clipboard: %v\n", err)
+			} else {
+				fmt.Println("✓ Đã copy lại câu lệnh chỉ dẫn handoff vào Clipboard!")
+			}
+			return
+		case "open":
+			latestLink := filepath.Join(config.GetHandoffsDir(), "latest.md")
+			target, err := os.Readlink(latestLink)
+			if err != nil {
+				fmt.Println("Lỗi: Chưa có bản snapshot handoff nào.")
+				return
+			}
+			fullPath := filepath.Join(config.GetHandoffsDir(), target)
+			_ = exec.Command("open", fullPath).Run()
+			fmt.Printf("Đang mở: %s\n", fullPath)
+			return
 		}
 	}
 
 	activeName := profile.GetActiveProfileName()
 	if activeName == "" {
 		fmt.Println("Lỗi: Chưa có profile nào đang hoạt động.")
-		return
+		os.Exit(1)
 	}
 	p, err := profile.ResolveProfile(activeName)
 	if err != nil {
 		fmt.Printf("Lỗi: %v\n", err)
-		return
+		os.Exit(1)
 	}
 	useLatest := hasFlag(args, "--latest")
-	executeHandoffFlow(p, useLatest)
+	force := hasFlag(args, "--force")
+	res, err := executeHandoffFlow(p, p, useLatest, force, false)
+	if err != nil {
+		fmt.Printf("Lỗi: %v\n", err)
+		os.Exit(1)
+	}
+	if res == nil || !res.Succeeded() {
+		if res != nil && res.Error != "" {
+			fmt.Printf("Lỗi tạo handoff: %s\n", res.Error)
+		} else if res != nil && res.Status == handoff.StatusSkipped {
+			fmt.Println("Thao tác tạo handoff đã bị hủy bởi người dùng.")
+		} else {
+			fmt.Println("Lỗi: Không tạo được snapshot handoff.")
+		}
+		os.Exit(1)
+	}
 }
 
 func handleHandoffList(args []string) {
@@ -506,6 +718,13 @@ func handleDoctor() {
 
 	cfg, _ := config.LoadConfig()
 	fmt.Printf("LLM Engine:        %s (%s)\n", cfg.LLM.BaseURL, cfg.LLM.Model)
+
+	if j, err := profile.ReadJournal(); err == nil && j != nil {
+		fmt.Printf("Journal:           ⚠️  Phát hiện phiên dở dang %s (%s -> %s, bước: %s)\n", j.OperationID, j.Source, j.Target, j.Step)
+		fmt.Println("                   Chạy `claude-switch recover` để phục hồi.")
+	} else {
+		fmt.Printf("Journal:           Sạch sẽ (không có thao tác dở dang)\n")
+	}
 }
 
 func handleMenu(args []string) {

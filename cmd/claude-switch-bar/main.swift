@@ -75,20 +75,32 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return "\(home)/.local/bin/claude-switch"
     }
 
-    func runCLI(args: [String]) -> String {
+    func runCLI(args: [String]) -> (output: String, exitCode: Int32) {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: getCLIPath())
         process.arguments = args
         let pipe = Pipe()
         process.standardOutput = pipe
-        process.standardError = Pipe()
+        process.standardError = pipe
+
+        var outputData = Data()
+        let group = DispatchGroup()
+        group.enter()
+
+        let fileHandle = pipe.fileHandleForReading
+        DispatchQueue.global(qos: .userInitiated).async {
+            outputData = fileHandle.readDataToEndOfFile()
+            group.leave()
+        }
+
         do {
             try process.run()
             process.waitUntilExit()
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            return String(data: data, encoding: .utf8) ?? ""
+            group.wait()
+            let outStr = String(data: outputData, encoding: .utf8) ?? ""
+            return (outStr, process.terminationStatus)
         } catch {
-            return ""
+            return ("", -1)
         }
     }
 
@@ -114,7 +126,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(statusHeader)
 
         // Parse profiles
-        let jsonOutput = runCLI(args: ["list", "--json"])
+        let jsonOutput = runCLI(args: ["list", "--json"]).output
         struct Profile: Codable {
             let name: String
             let is_active: Bool
@@ -223,9 +235,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func onSelectProfile(_ sender: NSMenuItem) {
         guard let name = sender.representedObject as? String else { return }
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            _ = self?.runCLI(args: ["use", name])
+            let res = self?.runCLI(args: ["use", name])
+            let exitCode = res?.exitCode ?? -1
+            let output = res?.output ?? ""
             DispatchQueue.main.async {
-                self?.showNotification(title: "Claude Switch", message: "Đã chuyển sang tài khoản \(name)")
+                if exitCode == 0 {
+                    self?.showNotification(title: "Claude Switch", message: "Đã chuyển sang tài khoản \(name)")
+                } else {
+                    let errMsg = output.trimmingCharacters(in: .whitespacesAndNewlines)
+                    self?.showNotification(title: "Claude Switch", message: errMsg.isEmpty ? "Lỗi khi chuyển sang tài khoản \(name)." : errMsg)
+                }
                 self?.rebuildMenu()
             }
         }
@@ -234,9 +253,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func onHandoffSwitch(_ sender: NSMenuItem) {
         guard let name = sender.representedObject as? String else { return }
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            _ = self?.runCLI(args: ["use", name, "-h", "--latest"])
+            let res = self?.runCLI(args: ["use", name, "-h", "--latest"])
+            let exitCode = res?.exitCode ?? -1
+            let output = res?.output ?? ""
             DispatchQueue.main.async {
-                self?.showNotification(title: "Claude Switch Handoff", message: "Đã chuyển sang \(name)! Context đã nằm trong clipboard, nhấn Cmd+V.")
+                if exitCode == 0 {
+                    self?.showNotification(title: "Claude Switch Handoff", message: "Đã chuyển sang \(name)! Context đã nằm trong clipboard, nhấn Cmd+V.")
+                } else {
+                    let errMsg = output.trimmingCharacters(in: .whitespacesAndNewlines)
+                    self?.showNotification(title: "Claude Switch Handoff", message: errMsg.isEmpty ? "Lỗi khi tạo handoff hoặc chuyển tài khoản." : errMsg)
+                }
                 self?.rebuildMenu()
             }
         }
@@ -260,9 +286,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func onRestartClaude() {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            _ = self?.runCLI(args: ["restart"])
+            let res = self?.runCLI(args: ["restart"])
+            let exitCode = res?.exitCode ?? -1
+            let output = res?.output ?? ""
             DispatchQueue.main.async {
-                self?.showNotification(title: "Claude Switch", message: "Đã khởi động lại Claude Desktop")
+                if exitCode == 0 {
+                    self?.showNotification(title: "Claude Switch", message: "Đã khởi động lại Claude Desktop")
+                } else {
+                    let errMsg = output.trimmingCharacters(in: .whitespacesAndNewlines)
+                    self?.showNotification(title: "Claude Switch", message: errMsg.isEmpty ? "Lỗi khi khởi động lại Claude." : errMsg)
+                }
                 self?.rebuildMenu()
             }
         }

@@ -155,9 +155,7 @@ func SwitchToProfile(target *ProfileItem, force bool) error {
 	EnsureFilesystemExtensionConfig(target.Path)
 
 	if fi, err := os.Lstat(dataDir); err == nil {
-		if fi.Mode()&os.ModeSymlink != 0 {
-			_ = os.Remove(dataDir)
-		} else if fi.IsDir() {
+		if fi.Mode()&os.ModeSymlink == 0 && fi.IsDir() {
 			// Real directory: back it up into profiles before replacing with symlink
 			backupDir := filepath.Join(config.GetProfilesDir(), fmt.Sprintf("initial_backup_%d", time.Now().Unix()))
 			if err := os.Rename(dataDir, backupDir); err != nil {
@@ -166,8 +164,20 @@ func SwitchToProfile(target *ProfileItem, force bool) error {
 		}
 	}
 
-	if err := os.Symlink(target.Path, dataDir); err != nil {
-		return fmt.Errorf("failed to create symlink %s -> %s: %w", dataDir, target.Path, err)
+	// Atomic symlink swap using temp symlink and rename
+	tmpLink := filepath.Join(filepath.Dir(dataDir), fmt.Sprintf(".Claude.tmp.%d", time.Now().UnixNano()))
+	_ = os.Remove(tmpLink)
+	if err := os.Symlink(target.Path, tmpLink); err != nil {
+		return fmt.Errorf("không thể tạo symlink tạm: %w", err)
+	}
+	if err := os.Rename(tmpLink, dataDir); err != nil {
+		_ = os.Remove(tmpLink)
+		return fmt.Errorf("không thể cập nhật symlink dataDir: %w", err)
+	}
+
+	resolved, err := os.Readlink(dataDir)
+	if err != nil || resolved != target.Path {
+		return fmt.Errorf("xác minh symlink dataDir thất bại: trỏ tới %q, mong đợi %q", resolved, target.Path)
 	}
 
 	displayName := target.Name
