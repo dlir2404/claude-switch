@@ -1,0 +1,11 @@
+# Binaries
+bin/
+
+# Architecture planning & issues
+PLAN.md
+*.plan
+issues.md
+*issue*.md
+
+# OS files
+.DS_Store
