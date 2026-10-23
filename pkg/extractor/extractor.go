@@ -2,10 +2,13 @@ package extractor
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
+	"math"
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -32,19 +35,30 @@ type Artifact struct {
 	Content    string `json:"content"`
 }
 
+type Attachment struct {
+	ID               string `json:"id,omitempty"`
+	FileName         string `json:"file_name,omitempty"`
+	FileSize         int    `json:"file_size,omitempty"`
+	FileType         string `json:"file_type,omitempty"`
+	ExtractedContent string `json:"extracted_content,omitempty"`
+	URL              string `json:"url,omitempty"`
+}
+
 type Message struct {
-	UUID       string     `json:"uuid"`
-	ParentUUID string     `json:"parent_uuid,omitempty"`
-	Sender     string     `json:"sender"`
-	Text       string     `json:"text"`
-	CreatedAt  string     `json:"created_at,omitempty"`
-	Artifacts  []Artifact `json:"artifacts,omitempty"`
+	UUID        string       `json:"uuid"`
+	ParentUUID  string       `json:"parent_uuid,omitempty"`
+	Sender      string       `json:"sender"`
+	Text        string       `json:"text"`
+	CreatedAt   string       `json:"created_at,omitempty"`
+	Artifacts   []Artifact   `json:"artifacts,omitempty"`
+	Attachments []Attachment `json:"attachments,omitempty"`
 }
 
 type ConversationDetail struct {
-	Summary   ConversationSummary `json:"summary"`
-	Messages  []Message           `json:"messages"`
-	Artifacts []Artifact          `json:"artifacts"`
+	Summary     ConversationSummary `json:"summary"`
+	Messages    []Message           `json:"messages"`
+	Artifacts   []Artifact          `json:"artifacts"`
+	Attachments []Attachment        `json:"attachments,omitempty"`
 }
 
 var uuidRegex = regexp.MustCompile(`[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}`)
@@ -247,6 +261,34 @@ func GetConversationDetail(profilePath string, targetUUID string) (*Conversation
 	}
 	detail.Messages = msgs
 
+	// Aggregate and deduplicate attachments from messages
+	seenAttIDs := make(map[string]bool)
+	for _, m := range msgs {
+		for _, att := range m.Attachments {
+			key := att.ID
+			if key == "" {
+				key = fmt.Sprintf("%s:%d", att.FileName, att.FileSize)
+			}
+			if !seenAttIDs[key] {
+				seenAttIDs[key] = true
+				detail.Attachments = append(detail.Attachments, att)
+			}
+		}
+	}
+	if len(detail.Attachments) == 0 {
+		rawAtts := extractAttachments(bestVal)
+		for _, att := range rawAtts {
+			key := att.ID
+			if key == "" {
+				key = fmt.Sprintf("%s:%d", att.FileName, att.FileSize)
+			}
+			if !seenAttIDs[key] {
+				seenAttIDs[key] = true
+				detail.Attachments = append(detail.Attachments, att)
+			}
+		}
+	}
+
 	return detail, nil
 }
 
@@ -378,7 +420,254 @@ func extractMessageText(data []byte) string {
 	return strings.Join(textParts, "\n\n")
 }
 
-func extractMessagesWithBranch(data []byte, currentLeaf string) ([]Message, error) {
+func v8FieldValuePositions(data []byte, key string) []int {
+	if len(key) == 0 || len(key) > 127 {
+		return nil
+	}
+	var positions []int
+	for pos := 0; pos < len(data); {
+		switch data[pos] {
+		case '"', 'c', 'S':
+			if pos+1 >= len(data) {
+				pos++
+				continue
+			}
+			r := bytes.NewReader(data[pos+1:])
+			length, err := leveldb.ReadVarint32(r)
+			if err != nil {
+				pos++
+				continue
+			}
+			varintBytes := int(r.Size()) - r.Len()
+			payloadStart := pos + 1 + varintBytes
+			if payloadStart > len(data) || uint64(length) > uint64(len(data)-payloadStart) {
+				pos++
+				continue
+			}
+			end := payloadStart + int(length)
+			if data[pos] == '"' && int(length) == len(key) && bytes.Equal(data[payloadStart:end], []byte(key)) {
+				positions = append(positions, end)
+			}
+			// Advance over string payloads so field-like bytes inside text cannot
+			// be mistaken for serialized object keys.
+			pos = end
+		case 'N', 'D':
+			if pos+9 <= len(data) {
+				pos += 9
+			} else {
+				pos++
+			}
+		case 'I', 'U', '^', 'A', 'a':
+			r := bytes.NewReader(data[pos+1:])
+			if _, err := leveldb.ReadVarint32(r); err == nil {
+				pos += 1 + int(r.Size()-int64(r.Len()))
+			} else {
+				pos++
+			}
+		case '$', '@':
+			r := bytes.NewReader(data[pos+1:])
+			if _, err := leveldb.ReadVarint32(r); err == nil {
+				first := int(r.Size()) - r.Len()
+				r2 := bytes.NewReader(data[pos+1+first:])
+				if _, err := leveldb.ReadVarint32(r2); err == nil {
+					pos += 1 + first + int(r2.Size()-int64(r2.Len()))
+				} else {
+					pos++
+				}
+			} else {
+				pos++
+			}
+		default:
+			pos++
+		}
+	}
+	return positions
+}
+
+func v8StringAt(data []byte, pos int) string {
+	if pos+2 <= len(data) && data[pos] == '"' && data[pos+1] == '$' {
+		if pos+2+36 <= len(data) {
+			candidate := string(data[pos+2 : pos+2+36])
+			if conversationUUIDPattern.MatchString(candidate) {
+				return candidate
+			}
+		}
+	}
+	value, _ := v8.ParseV8String(data, pos)
+	return value
+}
+
+func findExactV8Field(data []byte, key string) string {
+	positions := v8FieldValuePositions(data, key)
+	for i := len(positions) - 1; i >= 0; i-- {
+		if value := v8StringAt(data, positions[i]); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func findExactV8IntField(data []byte, key string) (int, bool) {
+	positions := v8FieldValuePositions(data, key)
+	if len(positions) == 0 {
+		return 0, false
+	}
+	pos := positions[len(positions)-1]
+	for pos < len(data) && data[pos] == 0 {
+		pos++
+	}
+	if pos >= len(data) {
+		return 0, false
+	}
+
+	switch data[pos] {
+	case 'I', 'U':
+		reader := bytes.NewReader(data[pos+1:])
+		value, err := leveldb.ReadVarint32(reader)
+		if err != nil {
+			return 0, false
+		}
+		if data[pos] == 'I' {
+			decoded := int32(value>>1) ^ -int32(value&1)
+			if decoded < 0 {
+				return 0, false
+			}
+			return int(decoded), true
+		}
+		if uint64(value) > uint64(^uint(0)>>1) {
+			return 0, false
+		}
+		return int(value), true
+	case 'N':
+		if pos+9 > len(data) {
+			return 0, false
+		}
+		value := math.Float64frombits(binary.LittleEndian.Uint64(data[pos+1 : pos+9]))
+		if math.IsNaN(value) || math.IsInf(value, 0) || value < 0 || value >= float64(^uint(0)>>1) || math.Trunc(value) != value {
+			return 0, false
+		}
+		return int(value), true
+	case '"', 'c':
+		value, _ := v8.ParseV8String(data, pos)
+		parsed, err := strconv.Atoi(strings.TrimSpace(value))
+		if err == nil && parsed >= 0 {
+			return parsed, true
+		}
+	}
+	return 0, false
+}
+
+func extractAttachments(data []byte) []Attachment {
+	ranges := scanV8ObjectRanges(data)
+	if len(ranges) == 0 {
+		return nil
+	}
+
+	positions := v8FieldValuePositions(data, "extracted_content")
+	attachments := make([]Attachment, 0, len(positions))
+	seenObjects := make(map[int]bool)
+
+	for _, contentPos := range positions {
+		var attachmentRange *v8ObjectRange
+		for i := range ranges {
+			r := &ranges[i]
+			if contentPos < r.start || contentPos >= r.end {
+				continue
+			}
+			if attachmentRange == nil || r.end-r.start < attachmentRange.end-attachmentRange.start {
+				attachmentRange = r
+			}
+		}
+		if attachmentRange == nil || seenObjects[attachmentRange.start] {
+			continue
+		}
+		seenObjects[attachmentRange.start] = true
+
+		object := data[attachmentRange.start:attachmentRange.end]
+		content := v8StringAt(data, contentPos)
+		if content == "" {
+			continue
+		}
+
+		id := findExactV8Field(object, "id")
+		fileName := findExactV8Field(object, "file_name")
+		fileType := findExactV8Field(object, "file_type")
+		if fileType == "" {
+			fileType = "txt"
+		}
+		fileSize, _ := findExactV8IntField(object, "file_size")
+
+		if fileName == "" {
+			firstLine := content
+			if nl := strings.IndexByte(content, '\n'); nl != -1 {
+				firstLine = strings.TrimSpace(content[:nl])
+			}
+			if strings.HasPrefix(firstLine, "# ") {
+				fileName = strings.TrimSpace(strings.TrimPrefix(firstLine, "# "))
+			} else if strings.HasPrefix(firstLine, "## ") {
+				fileName = strings.TrimSpace(strings.TrimPrefix(firstLine, "## "))
+			} else if id != "" {
+				fileName = fmt.Sprintf("attachment-%s.%s", id[:8], fileType)
+			} else {
+				fileName = fmt.Sprintf("attachment-%d.%s", len(attachments)+1, fileType)
+			}
+		}
+
+		attachments = append(attachments, Attachment{
+			ID:               id,
+			FileName:         fileName,
+			FileType:         fileType,
+			ExtractedContent: content,
+			FileSize:         fileSize,
+		})
+	}
+
+	return attachments
+}
+
+func findSenderInSlice(data []byte) string {
+	needle := []byte("sender\"")
+	pos := bytes.Index(data, needle)
+	if pos == -1 {
+		return ""
+	}
+	actual := pos + len(needle)
+	tail := data[actual:]
+	if len(tail) >= 5 {
+		if bytes.HasPrefix(tail, []byte("\x05human")) || bytes.HasPrefix(tail, []byte("\"human")) || bytes.HasPrefix(tail, []byte("human")) {
+			return "human"
+		} else if bytes.HasPrefix(tail, []byte("	assistant")) || bytes.HasPrefix(tail, []byte("\"assistant")) || bytes.HasPrefix(tail, []byte("assistant")) {
+			return "assistant"
+		}
+	}
+	str, _ := v8.ParseV8String(data, actual)
+	if str == "human" || str == "assistant" {
+		return str
+	}
+	return ""
+}
+
+func findParentUUIDInSlice(objSlice []byte, msgUUID string) string {
+	pNeedle := []byte("parent_message_uuid\"$")
+	pIdx := bytes.Index(objSlice, pNeedle)
+	if pIdx != -1 && pIdx+len(pNeedle)+36 <= len(objSlice) {
+		cand := string(objSlice[pIdx+len(pNeedle) : pIdx+len(pNeedle)+36])
+		if cand != msgUUID && (conversationUUIDPattern.MatchString(cand) || strings.HasPrefix(cand, "00000000")) {
+			return cand
+		}
+	}
+	pNeedle2 := []byte("parent_message_uuid\"")
+	pIdx2 := bytes.Index(objSlice, pNeedle2)
+	if pIdx2 != -1 {
+		str, _ := v8.ParseV8String(objSlice, pIdx2+len(pNeedle2))
+		if str != msgUUID && (conversationUUIDPattern.MatchString(str) || strings.HasPrefix(str, "00000000")) {
+			return str
+		}
+	}
+	return ""
+}
+
+func extractMessagesBySenderMarkers(data []byte) []Message {
 	var allMessages []Message
 	needle := []byte("sender\"")
 	var senderPositions []int
@@ -420,10 +709,8 @@ func extractMessagesWithBranch(data []byte, currentLeaf string) ([]Message, erro
 		window := data[prevSenderPos:actual]
 		prevSenderPos = actual + len(needle)
 
-		// Find Message UUID
 		msgUUID, uPos := findMessageUUID(window)
 
-		// Find Parent Message UUID (search forward around sender)
 		var parentUUID string
 		forwardLen := 1000
 		if i+1 < len(senderPositions) {
@@ -434,46 +721,111 @@ func extractMessagesWithBranch(data []byte, currentLeaf string) ([]Message, erro
 		forwardWindow := data[actual : actual+forwardLen]
 
 		pNeedle := []byte("parent_message_uuid\"$")
-		pIdx := bytes.Index(forwardWindow, pNeedle)
-		if pIdx != -1 && pIdx+len(pNeedle)+36 <= len(forwardWindow) {
-			cand := string(forwardWindow[pIdx+len(pNeedle) : pIdx+len(pNeedle)+36])
-			if conversationUUIDPattern.MatchString(cand) || strings.HasPrefix(cand, "00000000") {
+		pNeedle2 := []byte("parent_message_uuid\"")
+
+		fIdx := bytes.Index(forwardWindow, pNeedle)
+		if fIdx != -1 && fIdx+len(pNeedle)+36 <= len(forwardWindow) {
+			cand := string(forwardWindow[fIdx+len(pNeedle) : fIdx+len(pNeedle)+36])
+			if cand != msgUUID && (conversationUUIDPattern.MatchString(cand) || strings.HasPrefix(cand, "00000000")) {
 				parentUUID = cand
 			}
 		}
 		if parentUUID == "" {
-			pNeedle2 := []byte("parent_message_uuid\"")
-			pIdx2 := bytes.Index(forwardWindow, pNeedle2)
-			if pIdx2 != -1 {
-				str, _ := v8.ParseV8String(forwardWindow, pIdx2+len(pNeedle2))
-				if conversationUUIDPattern.MatchString(str) || strings.HasPrefix(str, "00000000") {
+			fIdx2 := bytes.Index(forwardWindow, pNeedle2)
+			if fIdx2 != -1 {
+				str, _ := v8.ParseV8String(forwardWindow, fIdx2+len(pNeedle2))
+				if str != msgUUID && (conversationUUIDPattern.MatchString(str) || strings.HasPrefix(str, "00000000")) {
 					parentUUID = str
 				}
 			}
 		}
 
-		// Extract text
+		if parentUUID == "" {
+			pIdx := bytes.Index(window, pNeedle)
+			if pIdx != -1 && pIdx+len(pNeedle)+36 <= len(window) {
+				cand := string(window[pIdx+len(pNeedle) : pIdx+len(pNeedle)+36])
+				if cand != msgUUID && (conversationUUIDPattern.MatchString(cand) || strings.HasPrefix(cand, "00000000")) {
+					parentUUID = cand
+				}
+			}
+			if parentUUID == "" {
+				pIdx2 := bytes.Index(window, pNeedle2)
+				if pIdx2 != -1 {
+					str, _ := v8.ParseV8String(window, pIdx2+len(pNeedle2))
+					if str != msgUUID && (conversationUUIDPattern.MatchString(str) || strings.HasPrefix(str, "00000000")) {
+						parentUUID = str
+					}
+				}
+			}
+		}
+
 		contentWindow := window
 		if uPos != -1 {
 			contentWindow = window[uPos:]
 		}
 		text := extractMessageText(contentWindow)
 
-		if text == "" {
-			text = cleanPrintableText(string(window))
-		}
 		if !utf8.ValidString(text) {
 			text = strings.ToValidUTF8(text, "")
 		}
 
-		if len(text) > 0 || msgUUID != "" {
+		msgAttachments := extractAttachments(window)
+
+		if len(text) > 0 || len(msgAttachments) > 0 || msgUUID != "" {
 			allMessages = append(allMessages, Message{
-				UUID:       msgUUID,
-				ParentUUID: parentUUID,
-				Sender:     sender,
-				Text:       text,
+				UUID:        msgUUID,
+				ParentUUID:  parentUUID,
+				Sender:      sender,
+				Text:        text,
+				Attachments: msgAttachments,
 			})
 		}
+	}
+	return allMessages
+}
+
+func extractMessagesWithBranch(data []byte, currentLeaf string) ([]Message, error) {
+	var allMessages []Message
+
+	// 1. Identify messages via strictly framed V8 object ranges
+	ranges := scanV8ObjectRanges(data)
+	if len(ranges) > 0 {
+		for _, r := range ranges {
+			objSlice := data[r.start:r.end]
+			if r.depth == 0 {
+				continue
+			}
+
+			sender := findSenderInSlice(objSlice)
+			if sender == "" {
+				continue
+			}
+
+			msgUUID, _ := findMessageUUID(objSlice)
+			if msgUUID == "" {
+				continue
+			}
+
+			parentUUID := findParentUUIDInSlice(objSlice, msgUUID)
+			text := extractMessageText(objSlice)
+			if !utf8.ValidString(text) {
+				text = strings.ToValidUTF8(text, "")
+			}
+			attachments := extractAttachments(objSlice)
+
+			allMessages = append(allMessages, Message{
+				UUID:        msgUUID,
+				ParentUUID:  parentUUID,
+				Sender:      sender,
+				Text:        text,
+				Attachments: attachments,
+			})
+		}
+	}
+
+	// 2. Fallback to sender-marker scanner if no structured message objects found
+	if len(allMessages) == 0 {
+		allMessages = extractMessagesBySenderMarkers(data)
 	}
 
 	if len(allMessages) == 0 {

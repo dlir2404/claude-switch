@@ -71,6 +71,13 @@ func CreateHandoff(cfg *config.Config, detail *extractor.ConversationDetail, fro
 	slug := slugify(detail.Summary.Title)
 	snapshotID := fmt.Sprintf("%s_%s", timestampStr, slug)
 
+	// Export attachments locally if present with strict verification
+	if len(detail.Attachments) > 0 {
+		if err := exportAttachmentsToDisk(handoffsDir, snapshotID, detail.Attachments); err != nil {
+			return nil, fmt.Errorf("lỗi khi xuất file đính kèm: %w", err)
+		}
+	}
+
 	var markdownContent string
 	generatorType := "rule_based"
 
@@ -211,39 +218,399 @@ generator: %s
 	return res, nil
 }
 
-func buildLLMPrompt(cfg *config.Config, detail *extractor.ConversationDetail, fromAccount string) string {
+func sanitizeFileName(name string) string {
+	name = strings.TrimSpace(name)
+	name = strings.ReplaceAll(name, "/", "-")
+	name = strings.ReplaceAll(name, "\\", "-")
+	name = strings.ReplaceAll(name, "—", "-")
+	name = strings.ReplaceAll(name, ":", "-")
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("Tiêu đề cuộc trò chuyện: %s\n", detail.Summary.Title))
-	b.WriteString(fmt.Sprintf("Tài khoản nguồn: %s\n", fromAccount))
-	b.WriteString(fmt.Sprintf("Model: %s\n\n", detail.Summary.Model))
-
-	b.WriteString("--- NỘI DUNG TRAO ĐỔI ---\n")
-	messages := detail.Messages
-	if cfg != nil && cfg.Handoff.MaxRecentMessages > 0 && len(messages) > cfg.Handoff.MaxRecentMessages {
-		messages = messages[len(messages)-cfg.Handoff.MaxRecentMessages:]
-	}
-
-	for _, m := range messages {
-		text := m.Text
-		if cfg != nil && cfg.Handoff.TruncateToolResultsChars > 0 && len(text) > cfg.Handoff.TruncateToolResultsChars*2 {
-			text = text[:cfg.Handoff.TruncateToolResultsChars] + "\n...[đã rút gọn]...\n" + text[len(text)-cfg.Handoff.TruncateToolResultsChars:]
+	for _, r := range name {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' || r == '.' || r == ' ' {
+			b.WriteRune(r)
 		}
-		b.WriteString(fmt.Sprintf("[%s]: %s\n\n", strings.ToUpper(m.Sender), text))
+	}
+	res := strings.TrimSpace(b.String())
+	if res == "" {
+		res = "attachment.txt"
+	} else if !strings.HasSuffix(res, ".txt") && !strings.Contains(res, ".") {
+		res += ".txt"
+	}
+	return res
+}
+
+func exportAttachmentsToDisk(handoffsDir, snapshotID string, attachments []extractor.Attachment) error {
+	if len(attachments) == 0 {
+		return nil
 	}
 
+	attDir := filepath.Join(handoffsDir, "attachments", snapshotID)
+	if err := os.MkdirAll(attDir, 0700); err != nil {
+		return fmt.Errorf("không thể tạo thư mục lưu attachment %s: %w", attDir, err)
+	}
+	_ = os.Chmod(attDir, 0700)
+
+	usedNames := make(map[string]int)
+
+	for i := range attachments {
+		att := &attachments[i]
+		baseName := sanitizeFileName(att.FileName)
+		if baseName == "" {
+			baseName = "attachment.txt"
+		}
+
+		// Disambiguate duplicate file names
+		ext := filepath.Ext(baseName)
+		nameWithoutExt := strings.TrimSuffix(baseName, ext)
+		usedNames[baseName]++
+		count := usedNames[baseName]
+
+		var fileName string
+		if count == 1 {
+			fileName = baseName
+		} else {
+			fileName = fmt.Sprintf("%s_%d%s", nameWithoutExt, count, ext)
+		}
+
+		filePath := filepath.Join(attDir, fileName)
+		contentBytes := []byte(att.ExtractedContent)
+
+		f, err := os.OpenFile(filePath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+		if err != nil {
+			return fmt.Errorf("không thể tạo file attachment %s: %w", filePath, err)
+		}
+
+		n, err := f.Write(contentBytes)
+		if err != nil {
+			_ = f.Close()
+			_ = os.Remove(filePath)
+			return fmt.Errorf("lỗi khi ghi nội dung attachment %s: %w", filePath, err)
+		}
+		if n != len(contentBytes) {
+			_ = f.Close()
+			_ = os.Remove(filePath)
+			return fmt.Errorf("ghi attachment không trọn vẹn: ghi %d/%d bytes vào %s", n, len(contentBytes), filePath)
+		}
+		if err := f.Sync(); err != nil {
+			_ = f.Close()
+			_ = os.Remove(filePath)
+			return fmt.Errorf("lỗi sync attachment %s: %w", filePath, err)
+		}
+		if err := f.Close(); err != nil {
+			_ = os.Remove(filePath)
+			return fmt.Errorf("lỗi đóng file attachment %s: %w", filePath, err)
+		}
+
+		// Verify file existence, regularity, and exact size
+		info, err := os.Stat(filePath)
+		if err != nil || !info.Mode().IsRegular() || info.Size() != int64(len(contentBytes)) {
+			_ = os.Remove(filePath)
+			return fmt.Errorf("xác minh attachment %s thất bại: file không hợp lệ hoặc kích thước không khớp", filePath)
+		}
+		if info.Mode().Perm() != 0600 {
+			_ = os.Chmod(filePath, 0600)
+		}
+
+		att.URL = filePath
+	}
+
+	return nil
+}
+
+func runeSafeTruncateMiddle(s string, headRunes, tailRunes int, notice string) string {
+	r := []rune(s)
+	if len(r) <= headRunes+tailRunes {
+		return s
+	}
+	head := string(r[:headRunes])
+	tail := string(r[len(r)-tailRunes:])
+	return head + notice + tail
+}
+
+var toolFenceTagRegex = regexp.MustCompile(`^(?i)(output|stdout|stderr|terminal|console|shell-output|bash-output|tool-output|tool_output|call_result)$`)
+var toolBlockFenceRegex = regexp.MustCompile("(?s)(```([a-zA-Z0-9_-]*)\n)(.*?)(```)")
+var toolBlockXmlRegex = regexp.MustCompile("(?s)(<(?:antml:call_result|function_results|tool_result|output)[^>]*>)(.*?)(</(?:antml:call_result|function_results|tool_result|output)>)")
+
+func truncateToolBlocks(text string, maxChars int) string {
+	if maxChars <= 0 {
+		return text
+	}
+
+	// Truncate XML tool results
+	text = toolBlockXmlRegex.ReplaceAllStringFunc(text, func(m string) string {
+		sub := toolBlockXmlRegex.FindStringSubmatch(m)
+		if len(sub) == 4 {
+			openTag, body, closeTag := sub[1], sub[2], sub[3]
+			r := []rune(body)
+			if len(r) > maxChars*2 {
+				body = runeSafeTruncateMiddle(body, maxChars, maxChars, "\n...[tool output đã rút gọn]...\n")
+				return openTag + body + closeTag
+			}
+		}
+		return m
+	})
+
+	// Truncate ONLY code fences explicitly tagged as tool outputs/logs (not programming languages like go, diff, ts, etc.)
+	text = toolBlockFenceRegex.ReplaceAllStringFunc(text, func(m string) string {
+		sub := toolBlockFenceRegex.FindStringSubmatch(m)
+		if len(sub) == 5 {
+			fullOpen, lang, body, closeTag := sub[1], sub[2], sub[3], sub[4]
+			if toolFenceTagRegex.MatchString(strings.TrimSpace(lang)) {
+				r := []rune(body)
+				if len(r) > maxChars*2 {
+					body = runeSafeTruncateMiddle(body, maxChars, maxChars, "\n...[tool output đã rút gọn]...\n")
+					return fullOpen + body + closeTag
+				}
+			}
+		}
+		return m
+	})
+
+	return text
+}
+
+func truncateToRuneBudget(text string, budget int, marker string) string {
+	if budget <= 0 {
+		return ""
+	}
+	runes := []rune(text)
+	if len(runes) <= budget {
+		return text
+	}
+	markerRunes := []rune(marker)
+	if len(markerRunes) >= budget {
+		return string(runes[:budget])
+	}
+	remaining := budget - len(markerRunes)
+	head := remaining / 2
+	tail := remaining - head
+	if tail == 0 {
+		return string(runes[:head]) + string(markerRunes)
+	}
+	return string(runes[:head]) + string(markerRunes) + string(runes[len(runes)-tail:])
+}
+
+type promptMessage struct {
+	sender string
+	text   string
+}
+
+func buildRecentMessagesSection(messages []promptMessage, budget int) string {
+	const heading = "--- NỘI DUNG TRAO ĐỔI ---\n"
+	const omission = "[... Các lượt trao đổi cũ hơn có thể đã được lược bỏ để ưu tiên nội dung gần nhất ...]\n\n"
+	if budget <= 0 {
+		return ""
+	}
+	if len([]rune(heading)) > budget {
+		return truncateToRuneBudget(heading, budget, "")
+	}
+	if len(messages) == 0 {
+		return heading
+	}
+
+	remaining := budget - len([]rune(heading))
+	reserveOmission := len(messages) > 1 && remaining > len([]rune(omission))
+	if reserveOmission {
+		remaining -= len([]rune(omission))
+	}
+	selected := make(map[int]string)
+	omitted := false
+
+	// Reserve space for the latest human request first so a long assistant
+	// response cannot crowd the handoff's triggering request out of the prompt.
+	latestUser := -1
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].sender == "human" || messages[i].sender == "user" {
+			latestUser = i
+			break
+		}
+	}
+	if latestUser >= 0 {
+		text := messages[latestUser].text
+		size := len([]rune(text))
+		if size <= remaining {
+			selected[latestUser] = text
+			remaining -= size
+		} else if remaining > 0 {
+			selected[latestUser] = truncateToRuneBudget(text, remaining, "\n...[yêu cầu mới nhất đã được rút gọn]...\n")
+			remaining = 0
+			omitted = true
+		}
+	}
+
+	for i := len(messages) - 1; i >= 0; i-- {
+		if i == latestUser {
+			continue
+		}
+		message := messages[i].text
+		size := len([]rune(message))
+		if size <= remaining {
+			selected[i] = message
+			remaining -= size
+			continue
+		}
+		omitted = true
+		if i == len(messages)-1 && remaining > 0 {
+			selected[i] = truncateToRuneBudget(message, remaining, "\n...[tin nhắn gần nhất đã được rút gọn]...\n")
+			remaining = 0
+		}
+		break
+	}
+
+	var section strings.Builder
+	section.WriteString(heading)
+	if omitted && reserveOmission {
+		section.WriteString(omission)
+	}
+	for i := range messages {
+		if message, ok := selected[i]; ok {
+			section.WriteString(message)
+		}
+	}
+	return truncateToRuneBudget(section.String(), budget, "")
+}
+
+func buildLLMPrompt(cfg *config.Config, detail *extractor.ConversationDetail, fromAccount string) string {
+	maxBudget := 0
+	limitConfigured := cfg != nil && cfg.Handoff.MaxInputTokens > 0
+	if limitConfigured {
+		maxInt := int(^uint(0) >> 1)
+		if cfg.Handoff.MaxInputTokens > maxInt/4 {
+			maxBudget = maxInt
+		} else {
+			maxBudget = cfg.Handoff.MaxInputTokens * 4
+		}
+		// The API request also includes a fixed system prompt, so reserve its
+		// estimated size before allocating the user prompt budget.
+		systemPromptRunes := len([]rune(llm.SystemHandoffPrompt))
+		if maxBudget <= systemPromptRunes {
+			return ""
+		}
+		maxBudget -= systemPromptRunes
+	}
+
+	toolMaxChars := 800
+	if cfg != nil && cfg.Handoff.TruncateToolResultsChars > 0 {
+		toolMaxChars = cfg.Handoff.TruncateToolResultsChars
+	}
+
+	header := fmt.Sprintf("Tiêu đề cuộc trò chuyện: %s\nTài khoản nguồn: %s\n", detail.Summary.Title, fromAccount)
+	if detail.Summary.Model != "" {
+		header += fmt.Sprintf("Model: %s\n", detail.Summary.Model)
+	}
+	header += "\n"
+
+	rawMsgs := detail.Messages
+	if cfg != nil && cfg.Handoff.MaxRecentMessages > 0 && len(rawMsgs) > cfg.Handoff.MaxRecentMessages {
+		rawMsgs = rawMsgs[len(rawMsgs)-cfg.Handoff.MaxRecentMessages:]
+	}
+	readyMsgs := make([]promptMessage, 0, len(rawMsgs))
+	for _, message := range rawMsgs {
+		text := strings.TrimSpace(message.Text)
+		if text == "" {
+			if len(message.Attachments) > 0 {
+				formatted := fmt.Sprintf("[%s]: (Đã đính kèm %d tài liệu ở phần trên)\n\n", strings.ToUpper(message.Sender), len(message.Attachments))
+				readyMsgs = append(readyMsgs, promptMessage{sender: message.Sender, text: formatted})
+			}
+			continue
+		}
+		if message.Sender == "assistant" && toolMaxChars > 0 {
+			text = truncateToolBlocks(text, toolMaxChars)
+		}
+		formatted := fmt.Sprintf("[%s]: %s\n\n", strings.ToUpper(message.Sender), text)
+		readyMsgs = append(readyMsgs, promptMessage{sender: message.Sender, text: formatted})
+	}
+
+	budgeted := limitConfigured
+	if budgeted {
+		// The setting is a conservative character estimate (four runes per token),
+		// not an endpoint tokenizer count. Keep metadata from consuming the prompt.
+		headerBudget := maxBudget / 10
+		if headerBudget > len([]rune(header)) {
+			headerBudget = len([]rune(header))
+		}
+		header = truncateToRuneBudget(header, headerBudget, "...[header rút gọn]...")
+	}
+
+	messageBudget := int(^uint(0) >> 1)
+	if budgeted {
+		remaining := maxBudget - len([]rune(header))
+		messageBudget = remaining
+		hasExtras := len(detail.Attachments) > 0 || (cfg != nil && cfg.Handoff.IncludeArtifacts && len(detail.Artifacts) > 0)
+		if hasExtras {
+			messageBudget = remaining/10*7 + remaining%10*7/10
+		}
+	}
+	messageSection := buildRecentMessagesSection(readyMsgs, messageBudget)
+
+	var artifactBuilder strings.Builder
 	if cfg != nil && cfg.Handoff.IncludeArtifacts && len(detail.Artifacts) > 0 {
-		b.WriteString("\n--- CÁC ARTIFACTS / MÃ NGUỒN HIỆN TẠI ---\n")
-		for _, art := range detail.Artifacts {
-			b.WriteString(fmt.Sprintf("### Artifact: %s (%s, %s)\n", art.Title, art.Identifier, art.Language))
-			b.WriteString(fmt.Sprintf("```%s\n%s\n```\n\n", art.Language, art.Content))
+		artifactBuilder.WriteString("--- CÁC ARTIFACTS / MÃ NGUỒN HIỆN TẠI ---\n")
+		for _, artifact := range detail.Artifacts {
+			artifactBuilder.WriteString(fmt.Sprintf("### Artifact: %s (%s, %s)\n", artifact.Title, artifact.Identifier, artifact.Language))
+			artifactBuilder.WriteString(fmt.Sprintf("```%s\n%s\n```\n\n", artifact.Language, artifact.Content))
 		}
 	}
+	artifactSection := artifactBuilder.String()
 
-	prompt := b.String()
-	if cfg != nil && cfg.Handoff.MaxInputTokens > 0 && len(prompt) > cfg.Handoff.MaxInputTokens*4 {
-		prompt = prompt[:cfg.Handoff.MaxInputTokens*4]
+	var attachmentBuilder strings.Builder
+	if len(detail.Attachments) > 0 {
+		attachmentBuilder.WriteString("--- TÀI LIỆU ĐÍNH KÈM (ATTACHMENTS) ---\n")
+		for i, attachment := range detail.Attachments {
+			title := attachment.FileName
+			if title == "" {
+				title = fmt.Sprintf("Tài liệu #%d", i+1)
+			}
+			meta := []string{fmt.Sprintf("Loại: %s", attachment.FileType)}
+			if attachment.ID != "" {
+				meta = append(meta, fmt.Sprintf("ID: %s", attachment.ID))
+			}
+			if attachment.URL != "" {
+				meta = append(meta, fmt.Sprintf("Đường dẫn: %s", attachment.URL))
+			}
+			attachmentBuilder.WriteString(fmt.Sprintf("### [%s] (%s)\n", title, strings.Join(meta, ", ")))
+			attachmentBuilder.WriteString(strings.TrimSpace(attachment.ExtractedContent) + "\n\n")
+		}
 	}
-	return prompt
+	attachmentSection := attachmentBuilder.String()
+
+	if budgeted {
+		extraBudget := maxBudget - len([]rune(header)) - len([]rune(messageSection))
+		if extraBudget < 0 {
+			extraBudget = 0
+		}
+		attachmentBudget, artifactBudget := 0, 0
+		switch {
+		case attachmentSection != "" && artifactSection != "":
+			attachmentBudget = extraBudget/3*2 + extraBudget%3*2/3
+			artifactBudget = extraBudget - attachmentBudget
+			if len([]rune(attachmentSection)) <= attachmentBudget {
+				artifactBudget += attachmentBudget - len([]rune(attachmentSection))
+				attachmentBudget = len([]rune(attachmentSection))
+			}
+			if len([]rune(artifactSection)) <= artifactBudget {
+				attachmentBudget += artifactBudget - len([]rune(artifactSection))
+				artifactBudget = len([]rune(artifactSection))
+			}
+		case attachmentSection != "":
+			attachmentBudget = extraBudget
+		case artifactSection != "":
+			artifactBudget = extraBudget
+		}
+		attachmentSection = truncateToRuneBudget(attachmentSection, attachmentBudget, "\n...[tài liệu đính kèm đã rút gọn]...\n")
+		artifactSection = truncateToRuneBudget(artifactSection, artifactBudget, "\n...[artifact đã rút gọn]...\n")
+	}
+
+	var prompt strings.Builder
+	prompt.WriteString(header)
+	if attachmentSection != "" {
+		prompt.WriteString(attachmentSection)
+	}
+	if artifactSection != "" {
+		prompt.WriteString(artifactSection)
+	}
+	prompt.WriteString(messageSection)
+	return prompt.String()
 }
 
 func GenerateRuleBasedMarkdown(cfg *config.Config, detail *extractor.ConversationDetail, fromAccount string) string {
@@ -257,13 +624,39 @@ func GenerateRuleBasedMarkdown(cfg *config.Config, detail *extractor.Conversatio
 		b.WriteString(fmt.Sprintf("- **Model**: %s\n", detail.Summary.Model))
 	}
 
+	sectionNum := 1
+
+	// 1. Attachments Section
+	if len(detail.Attachments) > 0 {
+		b.WriteString(fmt.Sprintf("\n## %d. Tài liệu đính kèm (Attachments)\n", sectionNum))
+		sectionNum++
+		for _, att := range detail.Attachments {
+			title := att.FileName
+			if title == "" {
+				title = "Tài liệu đính kèm"
+			}
+			b.WriteString(fmt.Sprintf("### %s\n", title))
+			if att.ID != "" {
+				b.WriteString(fmt.Sprintf("- **ID**: `%s`\n", att.ID))
+			}
+			if att.FileType != "" {
+				b.WriteString(fmt.Sprintf("- **Loại file**: `%s`\n", att.FileType))
+			}
+			if att.URL != "" {
+				b.WriteString(fmt.Sprintf("- **Đường dẫn cục bộ**: `%s`\n", att.URL))
+			}
+			b.WriteString(fmt.Sprintf("- **Nội dung trích xuất**:\n```%s\n%s\n```\n\n", att.FileType, strings.TrimSpace(att.ExtractedContent)))
+		}
+	}
+
 	includeArtifacts := true
 	if cfg != nil {
 		includeArtifacts = cfg.Handoff.IncludeArtifacts
 	}
 
 	if includeArtifacts && len(detail.Artifacts) > 0 {
-		b.WriteString("\n## 1. Toàn bộ Artifacts & Mã nguồn hoàn thiện\n")
+		b.WriteString(fmt.Sprintf("\n## %d. Toàn bộ Artifacts & Mã nguồn hoàn thiện\n", sectionNum))
+		sectionNum++
 		for _, art := range detail.Artifacts {
 			lang := art.Language
 			if lang == "" {
@@ -274,7 +667,9 @@ func GenerateRuleBasedMarkdown(cfg *config.Config, detail *extractor.Conversatio
 		}
 	}
 
-	b.WriteString("\n## 2. Diễn biến các lượt thảo luận gần nhất\n")
+	b.WriteString(fmt.Sprintf("\n## %d. Diễn biến các lượt thảo luận gần nhất\n", sectionNum))
+	sectionNum++
+
 	messages := detail.Messages
 	limit := 6
 	if cfg != nil && cfg.Handoff.MaxRecentMessages > 0 {
@@ -289,11 +684,18 @@ func GenerateRuleBasedMarkdown(cfg *config.Config, detail *extractor.Conversatio
 		if m.Sender == "assistant" {
 			role = "Claude"
 		}
-		b.WriteString(fmt.Sprintf("**%s**:\n%s\n\n", role, m.Text))
+		text := strings.TrimSpace(m.Text)
+		if text == "" {
+			if len(m.Attachments) > 0 {
+				b.WriteString(fmt.Sprintf("**%s**:\n*(Đã đính kèm %d tài liệu ở phần trên)*\n\n", role, len(m.Attachments)))
+			}
+			continue
+		}
+		b.WriteString(fmt.Sprintf("**%s**:\n%s\n\n", role, text))
 	}
 
-	b.WriteString("## 3. Bước tiếp theo\n")
-	b.WriteString("Hãy tiếp tục giải quyết yêu cầu kỹ thuật đang dang dở dựa trên các artifacts và bối cảnh ở trên.\n")
+	b.WriteString(fmt.Sprintf("## %d. Bước tiếp theo\n", sectionNum))
+	b.WriteString("Hãy tiếp tục giải quyết yêu cầu kỹ thuật đang dang dở dựa trên các tài liệu, artifacts và bối cảnh ở trên.\n")
 
 	return b.String()
 }

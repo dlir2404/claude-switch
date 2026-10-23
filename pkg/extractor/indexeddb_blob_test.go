@@ -490,8 +490,23 @@ func TestRealProfileValidation(t *testing.T) {
 		}
 	}
 
-	t.Logf("Validated real profile %s, conv %s: %d messages, leaf=%s (UTF-8 valid: true)",
-		profilePath, targetUUID, len(detail.Messages), detail.Summary.CurrentLeaf)
+	if len(detail.Attachments) != 2 {
+		t.Errorf("expected 2 attachments in real profile, got %d", len(detail.Attachments))
+	} else {
+		t.Logf("Attachment 1: %s (type: %s, size: %d)", detail.Attachments[0].FileName, detail.Attachments[0].FileType, len(detail.Attachments[0].ExtractedContent))
+		t.Logf("Attachment 2: %s (type: %s, size: %d)", detail.Attachments[1].FileName, detail.Attachments[1].FileType, len(detail.Attachments[1].ExtractedContent))
+	}
+
+	// Verify Message 10 does not contain raw serialized metadata
+	if len(detail.Messages) >= 10 {
+		msg10 := detail.Messages[9] // 0-indexed Message 10
+		if strings.Contains(msg10.Text, "sync_sources") || strings.Contains(msg10.Text, "files") || strings.Contains(msg10.Text, "attachments") {
+			t.Errorf("Message 10 contains raw serialized metadata: %q", msg10.Text)
+		}
+	}
+
+	t.Logf("Validated real profile %s, conv %s: %d messages, %d attachments, leaf=%s (UTF-8 valid: true)",
+		profilePath, targetUUID, len(detail.Messages), len(detail.Attachments), detail.Summary.CurrentLeaf)
 }
 
 func TestDenseAndSparseArraysWithLengthsMatchingTags(t *testing.T) {
@@ -653,5 +668,141 @@ func TestConversationWithMoreThan111Messages(t *testing.T) {
 	}
 	if detail.Messages[totalMessages-1].Text != "Turn 115 question" {
 		t.Errorf("expected last message %q, got %q", "Turn 115 question", detail.Messages[totalMessages-1].Text)
+	}
+}
+
+func buildSyntheticAttachment(id, fileName, fileType, content string) []byte {
+	var buf bytes.Buffer
+	buf.WriteByte('o')
+	buf.Write(appendV8TestString(nil, "id", id))
+	buf.Write(appendV8TestString(nil, "file_name", fileName))
+	buf.Write(appendV8TestString(nil, "file_type", fileType))
+	buf.Write(appendV8TestString(nil, "extracted_content", content))
+	buf.WriteByte('{')
+	buf.WriteByte(4)
+	return buf.Bytes()
+}
+
+func TestExtractAttachmentsFromBlob(t *testing.T) {
+	tempDir := t.TempDir()
+	blobDir := filepath.Join(tempDir, "IndexedDB", "https_claude.ai_0.indexeddb.blob", "1", "00")
+	if err := os.MkdirAll(blobDir, 0755); err != nil {
+		t.Fatalf("failed to create blob dir: %v", err)
+	}
+
+	convUUID := "842eb422-4a50-4e9a-a595-d45b4b5a877e"
+	msg1UUID := "01a13ad7-b64b-758f-8fcf-aab77f6277c1"
+	msg2UUID := "01a13ad7-b64b-758f-8fcf-aab77f6277c2"
+	leafUUID := "01a13dd1-417a-7d7b-b856-acf6a3716ee3"
+	att1ID := "a117f5c7-17f4-5ce7-a930-8b2a3135057d"
+	att2ID := "ea2d8f15-fe1d-50e8-9018-2119abe689a2"
+
+	var payload bytes.Buffer
+	payload.WriteByte('o')
+	payload.Write(appendV8TestString(nil, "conversationUuid", convUUID))
+	payload.Write(appendV8TestString(nil, "name", "Attachment Test Conversation"))
+	payload.Write(appendV8TestString(nil, "current_leaf_message_uuid", leafUUID))
+	payload.Write(appendV8TestString(nil, "chat_messages", ""))
+	payload.WriteByte('A')
+	payload.WriteByte(3)
+
+	// Message 1: First message (human) with sender THEN attachments (real Claude serialization order)
+	var msg1Buf bytes.Buffer
+	msg1Buf.WriteByte('o')
+	msg1Buf.Write(appendV8TestString(nil, "uuid", msg1UUID))
+	msg1Buf.Write(appendV8TestString(nil, "text", "Please review the first document"))
+	msg1Buf.Write(appendV8TestString(nil, "sender", "human"))
+	msg1Buf.Write(appendV8TestString(nil, "attachments", ""))
+	msg1Buf.WriteByte('a')
+	msg1Buf.WriteByte(1)
+	msg1Buf.Write(buildSyntheticAttachment(att1ID, "", "txt", "# First Doc\nContent of first document"))
+	msg1Buf.WriteByte('@')
+	msg1Buf.WriteByte(0)
+	msg1Buf.WriteByte(1)
+	msg1Buf.Write(appendV8TestString(nil, "parent_message_uuid", "00000000-0000-4000-8000-000000000000"))
+	msg1Buf.WriteByte('{')
+	msg1Buf.WriteByte(5)
+	payload.Write(msg1Buf.Bytes())
+
+	// Message 2: Middle message (assistant) with sender and NO attachments
+	var msg2Buf bytes.Buffer
+	msg2Buf.WriteByte('o')
+	msg2Buf.Write(appendV8TestString(nil, "uuid", msg2UUID))
+	msg2Buf.Write(appendV8TestString(nil, "text", "Here is my preliminary review"))
+	msg2Buf.Write(appendV8TestString(nil, "sender", "assistant"))
+	msg2Buf.Write(appendV8TestString(nil, "parent_message_uuid", msg1UUID))
+	msg2Buf.WriteByte('{')
+	msg2Buf.WriteByte(4)
+	payload.Write(msg2Buf.Bytes())
+
+	// Message 3: Last message (human, leaf) with sender THEN attachments
+	var msg3Buf bytes.Buffer
+	msg3Buf.WriteByte('o')
+	msg3Buf.Write(appendV8TestString(nil, "uuid", leafUUID))
+	msg3Buf.Write(appendV8TestString(nil, "text", "Here is the final plan"))
+	msg3Buf.Write(appendV8TestString(nil, "sender", "human"))
+	msg3Buf.Write(appendV8TestString(nil, "attachments", ""))
+	msg3Buf.WriteByte('a')
+	msg3Buf.WriteByte(1)
+	msg3Buf.Write(buildSyntheticAttachment(att2ID, "plan.txt", "txt", "Content of final plan"))
+	msg3Buf.WriteByte('@')
+	msg3Buf.WriteByte(0)
+	msg3Buf.WriteByte(1)
+	msg3Buf.Write(appendV8TestString(nil, "parent_message_uuid", msg2UUID))
+	msg3Buf.WriteByte('{')
+	msg3Buf.WriteByte(5)
+	payload.Write(msg3Buf.Bytes())
+
+	payload.WriteByte('$')
+	payload.WriteByte(0)
+	payload.WriteByte(3)
+
+	payload.WriteByte('{')
+	payload.WriteByte(4)
+
+	var fileData bytes.Buffer
+	fileData.Write([]byte{0xff, 0x11, 0x02})
+	fileData.Write(makeSnappyLiteral(payload.Bytes()))
+	_ = os.WriteFile(filepath.Join(blobDir, "test_attachments_blob"), fileData.Bytes(), 0644)
+
+	detail, err := GetConversationDetail(tempDir, convUUID)
+	if err != nil {
+		t.Fatalf("GetConversationDetail failed: %v", err)
+	}
+
+	if len(detail.Messages) != 3 {
+		t.Fatalf("expected 3 messages, got %d", len(detail.Messages))
+	}
+
+	// Verify Message 1 (first message) received Attachment 1
+	if len(detail.Messages[0].Attachments) != 1 {
+		t.Fatalf("expected msg0 to have 1 attachment, got %d", len(detail.Messages[0].Attachments))
+	}
+	if detail.Messages[0].Attachments[0].ID != att1ID {
+		t.Errorf("msg0 attachment ID mismatch: got %s, want %s", detail.Messages[0].Attachments[0].ID, att1ID)
+	}
+	if detail.Messages[0].Attachments[0].FileName != "First Doc" {
+		t.Errorf("msg0 attachment FileName mismatch: got %q, want 'First Doc'", detail.Messages[0].Attachments[0].FileName)
+	}
+
+	// Verify Message 2 has 0 attachments
+	if len(detail.Messages[1].Attachments) != 0 {
+		t.Errorf("expected msg1 to have 0 attachments, got %d", len(detail.Messages[1].Attachments))
+	}
+
+	// Verify Message 3 (last message) received Attachment 2
+	if len(detail.Messages[2].Attachments) != 1 {
+		t.Fatalf("expected msg2 (last message) to have 1 attachment, got %d", len(detail.Messages[2].Attachments))
+	}
+	if detail.Messages[2].Attachments[0].ID != att2ID {
+		t.Errorf("msg2 attachment ID mismatch: got %s, want %s", detail.Messages[2].Attachments[0].ID, att2ID)
+	}
+	if detail.Messages[2].Attachments[0].FileName != "plan.txt" {
+		t.Errorf("msg2 attachment FileName mismatch: got %q, want 'plan.txt'", detail.Messages[2].Attachments[0].FileName)
+	}
+
+	// Verify ConversationDetail aggregated both attachments without duplication
+	if len(detail.Attachments) != 2 {
+		t.Fatalf("expected 2 aggregated attachments in detail, got %d", len(detail.Attachments))
 	}
 }

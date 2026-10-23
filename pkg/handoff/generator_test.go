@@ -277,3 +277,301 @@ func TestInterruptedSnapshotLeavesNoPartialMD(t *testing.T) {
 		t.Errorf("latest.md should still point to initial snapshot %s, got %s", initialRes.SnapshotPath, target)
 	}
 }
+
+func TestHandoffLongMessageWithMiddleConclusionAndAttachments(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := config.DefaultConfig()
+	cfg.Handoff.SaveDir = tmpDir
+	cfg.Handoff.TruncateToolResultsChars = 800
+	cfg.Handoff.MaxInputTokens = 64000
+
+	att1Content := "# Reviewer Handoff\n" + strings.Repeat("Baseline review details and findings.\n", 300)
+	att2Content := "# Phase 1 Fix Plan\n" + strings.Repeat("Action items and fixes plan for CR Agent.\n", 700)
+
+	middleConclusion := "KẾT LUẬN QUAN TRỌNG: Đã pass 10/10 test case, cấu trúc mã nguồn đạt chuẩn."
+	vietnameseBoundary := "Kiểm tra kỹ lưỡng các ký tự tiếng Việt đặc thù như đ, ế, ữ, ợ, ắ không bị cắt đôi rune."
+
+	// 5,000 characters of raw tool output inside a code fence
+	massiveToolBlock := "```output\n" + strings.Repeat("DEBUG: 2026-10-14 leveldb record dump raw bytes 0x11 0x22\n", 80) + "```"
+
+	longAssistantText := fmt.Sprintf("Bắt đầu thực hiện kiểm tra code và chạy công cụ:\n\n%s\n\nPhân tích chi tiết sau khi chạy công cụ:\n%s\n\n%s\n\nĐề xuất các bước tiếp theo để hoàn thiện.",
+		massiveToolBlock, middleConclusion, vietnameseBoundary)
+
+	detail := &extractor.ConversationDetail{
+		Summary: extractor.ConversationSummary{
+			UUID:  "conv-long-test",
+			Title: "Long Test with Attachments",
+			Model: "claude-sonnet-5-5",
+		},
+		Attachments: []extractor.Attachment{
+			{
+				ID:               "att-uuid-1",
+				FileName:         "Reviewer Handoff.txt",
+				FileType:         "txt",
+				ExtractedContent: att1Content,
+			},
+			{
+				ID:               "att-uuid-2",
+				FileName:         "Phase 1 Fix Plan.txt",
+				FileType:         "txt",
+				ExtractedContent: att2Content,
+			},
+		},
+		Messages: []extractor.Message{
+			{
+				Sender: "human",
+				Text:   "Yêu cầu reviewer kiểm tra kỹ lưỡng các thay đổi mới nhất.",
+			},
+			{
+				Sender: "assistant",
+				Text:   longAssistantText,
+			},
+			{
+				Sender: "assistant",
+				Text:   "", // Empty canceled message
+			},
+		},
+	}
+
+	// 1. Check buildLLMPrompt
+	prompt := buildLLMPrompt(cfg, detail, "user@example.com")
+
+	if !strings.Contains(prompt, "--- TÀI LIỆU ĐÍNH KÈM (ATTACHMENTS) ---") {
+		t.Errorf("prompt missing Attachments heading")
+	}
+	if !strings.Contains(prompt, "Reviewer Handoff.txt") || !strings.Contains(prompt, "Phase 1 Fix Plan.txt") {
+		t.Errorf("prompt missing attachment titles")
+	}
+	if !strings.Contains(prompt, "Action items and fixes plan for CR Agent.") {
+		t.Errorf("prompt missing attachment content")
+	}
+	// Middle conclusion MUST be preserved
+	if !strings.Contains(prompt, middleConclusion) {
+		t.Errorf("middle conclusion was incorrectly truncated from prompt: expected %q", middleConclusion)
+	}
+	// Tool output block MUST be truncated
+	if !strings.Contains(prompt, "...[tool output đã rút gọn]...") {
+		t.Errorf("expected tool block to be truncated with notice in prompt")
+	}
+	// Vietnamese characters must be preserved without UTF-8 corruption
+	if !strings.Contains(prompt, vietnameseBoundary) {
+		t.Errorf("Vietnamese boundary string was corrupted: expected %q", vietnameseBoundary)
+	}
+	// Empty message should not leak raw empty brackets
+	if strings.Contains(prompt, "[ASSISTANT]: \n\n") {
+		t.Errorf("prompt contains empty assistant message block")
+	}
+
+	// 2. Check Rule-based Markdown
+	md := GenerateRuleBasedMarkdown(cfg, detail, "user@example.com")
+
+	if !strings.Contains(md, "## 1. Tài liệu đính kèm (Attachments)") {
+		t.Errorf("markdown missing Attachments section")
+	}
+	if !strings.Contains(md, middleConclusion) {
+		t.Errorf("markdown missing middle conclusion")
+	}
+
+	// 3. Check CreateHandoff exports attachments to disk
+	res, err := CreateHandoff(cfg, detail, "user@example.com")
+	if err != nil {
+		t.Fatalf("CreateHandoff failed: %v", err)
+	}
+
+	// Verify attachments directory created
+	attDir := filepath.Join(tmpDir, "attachments", res.SnapshotPath[len(tmpDir)+1:len(res.SnapshotPath)-3])
+	entries, err := os.ReadDir(attDir)
+	if err != nil {
+		t.Fatalf("failed to read attachments dir %s: %v", attDir, err)
+	}
+	if len(entries) != 2 {
+		t.Errorf("expected 2 attachment files exported, got %d", len(entries))
+	}
+}
+
+func TestBudgetExceededPreservesNewestUserMessage(t *testing.T) {
+	cfg := config.DefaultConfig()
+	// Strict small budget: 500 tokens ~ 2000 runes
+	cfg.Handoff.MaxInputTokens = 500
+	cfg.Handoff.MaxRecentMessages = 0
+
+	ancientMarker := "FIRST_MESSAGE_MARKER_ANCIENT: This is ancient history from long ago."
+	latestMarker := "LATEST_USER_REQUEST_DO_NOT_LOSE: Vui lòng sửa gấp lỗi crash trên production!"
+
+	detail := &extractor.ConversationDetail{
+		Summary: extractor.ConversationSummary{
+			Title: "Budget Allocation Test",
+			Model: "claude-sonnet-5-5",
+		},
+		Attachments: []extractor.Attachment{
+			{
+				ID:               "att-big-1",
+				FileName:         "big_spec.txt",
+				FileType:         "txt",
+				ExtractedContent: strings.Repeat("Tài liệu đặc tả rất dài có thể chiếm hết token.\n", 150),
+			},
+		},
+		Messages: []extractor.Message{
+			{
+				Sender: "human",
+				Text:   ancientMarker + strings.Repeat(" Chi tiết cũ cần cắt bớt.", 30),
+			},
+			{
+				Sender: "assistant",
+				Text:   "Phản hồi từ xa xưa: " + strings.Repeat("Giải thích dài dòng cũ.", 30),
+			},
+			{
+				Sender: "human",
+				Text:   "Yêu cầu giữa chừng: " + strings.Repeat("Thông tin thêm.", 20),
+			},
+			{
+				Sender: "assistant",
+				Text:   "Phản hồi giữa chừng: " + strings.Repeat("Giải thích thêm.", 20),
+			},
+			{
+				Sender: "human",
+				Text:   latestMarker,
+			},
+		},
+	}
+
+	prompt := buildLLMPrompt(cfg, detail, "user@example.com")
+
+	// 1. The LATEST user request MUST BE 100% PRESERVED
+	if !strings.Contains(prompt, latestMarker) {
+		t.Errorf("prompt lost the newest user request when budget was exceeded! expected %q in prompt", latestMarker)
+	}
+
+	// 2. The ancient first message must be dropped to preserve the newest request
+	if strings.Contains(prompt, ancientMarker) {
+		t.Errorf("expected ancient message to be dropped when budget was exceeded, but it was still present")
+	}
+
+	// 3. Clear omission notice must be present
+	if !strings.Contains(prompt, "đã được lược bỏ để ưu tiên") {
+		t.Errorf("prompt missing omission notice for dropped older messages")
+	}
+
+	// 4. Prompt total rune length must respect the token budget
+	promptRunes := len([]rune(prompt))
+	maxAllowed := cfg.Handoff.MaxInputTokens * 4
+	if promptRunes > maxAllowed+200 { // small allowance for header/formatting
+		t.Errorf("prompt exceeded budget: got %d runes, max %d runes", promptRunes, maxAllowed)
+	}
+}
+
+func TestCodeFencesNotTruncatedOnlyToolOutputTruncated(t *testing.T) {
+	crucialGoCode := "func CrucialAlgorithmInMiddle() bool {\n    return true\n}"
+	crucialDiff := "+ CRUCIAL_DIFF_CHANGE_IN_MIDDLE = 12345"
+
+	// 1. Assistant message with long Go code fence (>2000 chars)
+	longGoBlock := "```go\n// Package header\n" + strings.Repeat("// Code line padding\n", 50) +
+		crucialGoCode + "\n" + strings.Repeat("// Code tail padding\n", 50) + "```"
+
+	// 2. Assistant message with long Diff code fence (>2000 chars)
+	longDiffBlock := "```diff\n--- a/file.go\n+++ b/file.go\n" + strings.Repeat("@@ -1,5 +1,5 @@\n", 40) +
+		crucialDiff + "\n" + strings.Repeat("@@ -10,5 +10,5 @@\n", 40) + "```"
+
+	// 3. Assistant message with long Output fence (tool output) (>2000 chars)
+	longOutputBlock := "```output\n" + strings.Repeat("RAW TERMINAL DUMP LINE 0x00\n", 80) + "```"
+
+	text := fmt.Sprintf("Dưới đây là mã nguồn và kết quả kiểm tra:\n\n%s\n\n%s\n\n%s\n\nHoàn tất.",
+		longGoBlock, longDiffBlock, longOutputBlock)
+
+	res := truncateToolBlocks(text, 500)
+
+	// Go block MUST be preserved completely (not truncated)
+	if !strings.Contains(res, crucialGoCode) {
+		t.Errorf("Go code fence was incorrectly truncated! expected %q to be preserved", crucialGoCode)
+	}
+
+	// Diff block MUST be preserved completely (not truncated)
+	if !strings.Contains(res, crucialDiff) {
+		t.Errorf("Diff fence was incorrectly truncated! expected %q to be preserved", crucialDiff)
+	}
+
+	// Output block MUST be truncated
+	if !strings.Contains(res, "...[tool output đã rút gọn]...") {
+		t.Errorf("Output fence was not truncated when exceeding limit")
+	}
+}
+
+func TestAttachmentExportErrorHandlingAndDisambiguation(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := config.DefaultConfig()
+	cfg.Handoff.SaveDir = tmpDir
+	cfg.LLM.Enabled = false
+
+	// Test 1: Duplicate filenames must be disambiguated, not overwritten
+	detail := &extractor.ConversationDetail{
+		Summary: extractor.ConversationSummary{
+			Title: "Duplicate Files Test",
+		},
+		Attachments: []extractor.Attachment{
+			{
+				ID:               "id-1",
+				FileName:         "plan.txt",
+				FileType:         "txt",
+				ExtractedContent: "Plan 1 content",
+			},
+			{
+				ID:               "id-2",
+				FileName:         "plan.txt", // Same name!
+				FileType:         "txt",
+				ExtractedContent: "Plan 2 different content",
+			},
+		},
+		Messages: []extractor.Message{
+			{Sender: "human", Text: "Hello"},
+		},
+	}
+
+	res, err := CreateHandoff(cfg, detail, "user@example.com")
+	if err != nil {
+		t.Fatalf("CreateHandoff failed: %v", err)
+	}
+
+	// Verify both files were created with distinct names
+	attDir := filepath.Join(tmpDir, "attachments", res.SnapshotPath[len(tmpDir)+1:len(res.SnapshotPath)-3])
+	entries, err := os.ReadDir(attDir)
+	if err != nil {
+		t.Fatalf("failed to read attachments dir: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 distinct attachment files, got %d", len(entries))
+	}
+
+	names := []string{entries[0].Name(), entries[1].Name()}
+	if names[0] == names[1] {
+		t.Errorf("filenames were not disambiguated: %v", names)
+	}
+
+	// Verify permissions are 0600
+	for _, entry := range entries {
+		info, err := entry.Info()
+		if err != nil {
+			t.Fatalf("failed to get file info: %v", err)
+		}
+		if info.Mode().Perm() != 0600 {
+			t.Errorf("expected file mode 0600 for %s, got %#o", entry.Name(), info.Mode().Perm())
+		}
+	}
+
+	// Test 2: Error handling when save directory is non-writable
+	badDir := filepath.Join(tmpDir, "readonly_dir")
+	_ = os.MkdirAll(badDir, 0700)
+	// Create read-only attachments subfolder
+	badAttDir := filepath.Join(badDir, "attachments")
+	_ = os.MkdirAll(badAttDir, 0500)
+	_ = os.Chmod(badAttDir, 0500)
+
+	cfgBad := config.DefaultConfig()
+	cfgBad.Handoff.SaveDir = badDir
+	cfgBad.LLM.Enabled = false
+
+	_, errBad := CreateHandoff(cfgBad, detail, "user@example.com")
+	if errBad == nil {
+		t.Errorf("expected CreateHandoff to fail when attachments directory cannot be written, got nil")
+	}
+	_ = os.Chmod(badAttDir, 0700)
+}
