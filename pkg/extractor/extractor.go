@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"claude-switch/pkg/leveldb"
 	"claude-switch/pkg/v8"
@@ -153,27 +154,33 @@ func ListConversations(profilePath string) ([]ConversationSummary, error) {
 }
 
 func GetConversationDetail(profilePath string, targetUUID string) (*ConversationDetail, error) {
-	leveldbDir := filepath.Join(profilePath, "IndexedDB", "https_claude.ai_0.indexeddb.leveldb")
-	records, err := leveldb.ReadConsistentDatabase(leveldbDir)
-	if err != nil {
-		return nil, fmt.Errorf("không thể đọc IndexedDB của profile: %w", err)
-	}
-
-	// Find the record matching targetUUID with the highest sequence number
 	var bestVal []byte
 	var bestSeq uint64
 
-	for _, rec := range records {
-		if bytes.Contains(rec.Value, []byte(targetUUID)) {
-			if len(bestVal) == 0 || rec.Seq > bestSeq || (rec.Seq == bestSeq && len(rec.Value) > len(bestVal)) {
-				bestVal = rec.Value
-				bestSeq = rec.Seq
+	// 1. Try finding in Chromium's IndexedDB .blob storage first (where full chat payloads are kept)
+	blobData, err := findConversationBlob(profilePath, targetUUID)
+	if err == nil && len(blobData) > 0 {
+		bestVal = blobData
+	} else {
+		// 2. Fall back to LevelDB records
+		leveldbDir := filepath.Join(profilePath, "IndexedDB", "https_claude.ai_0.indexeddb.leveldb")
+		records, err := leveldb.ReadConsistentDatabase(leveldbDir)
+		if err != nil {
+			return nil, fmt.Errorf("không thể đọc IndexedDB của profile: %w", err)
+		}
+
+		for _, rec := range records {
+			if bytes.Contains(rec.Value, []byte(targetUUID)) {
+				if len(bestVal) == 0 || rec.Seq > bestSeq || (rec.Seq == bestSeq && len(rec.Value) > len(bestVal)) {
+					bestVal = rec.Value
+					bestSeq = rec.Seq
+				}
 			}
 		}
 	}
 
 	if len(bestVal) == 0 {
-		return nil, fmt.Errorf("conversation %s not found in LevelDB", targetUUID)
+		return nil, fmt.Errorf("conversation %s not found in LevelDB or blob storage", targetUUID)
 	}
 
 	detail := &ConversationDetail{
@@ -185,26 +192,44 @@ func GetConversationDetail(profilePath string, targetUUID string) (*Conversation
 	}
 
 	// Extract Title
-	nIdx := bytes.Index(bestVal, []byte("\x04name"))
-	if nIdx != -1 {
-		title, _ := v8.ParseV8String(bestVal, nIdx+5)
+	if title := v8.FindV8Field(bestVal, "name"); title != "" {
 		detail.Summary.Title = strings.TrimSpace(title)
+	}
+	if detail.Summary.Title == "" {
+		if title := v8.FindV8Field(bestVal, "\x04name"); title != "" {
+			detail.Summary.Title = strings.TrimSpace(title)
+		}
 	}
 	if detail.Summary.Title == "" {
 		detail.Summary.Title = "(Untitled)"
 	}
 
 	// Extract Model
-	mIdx := bytes.Index(bestVal, []byte("model\""))
-	if mIdx != -1 {
-		mod, _ := v8.ParseV8String(bestVal, mIdx+6)
-		detail.Summary.Model = mod
+	if mod := v8.FindV8Field(bestVal, "model"); mod != "" {
+		detail.Summary.Model = strings.TrimSpace(mod)
+	}
+	if detail.Summary.Model == "" {
+		if mod := v8.FindV8Field(bestVal, "\x05model"); mod != "" {
+			detail.Summary.Model = strings.TrimSpace(mod)
+		}
 	}
 
 	// Extract Current Leaf UUID
-	leafIdx := bytes.Index(bestVal, []byte("current_leaf_message_uuid\"$"))
-	if leafIdx != -1 && leafIdx+27+36 <= len(bestVal) {
-		detail.Summary.CurrentLeaf = string(bestVal[leafIdx+27 : leafIdx+27+36])
+	leafIdx := bytes.Index(bestVal, []byte("current_leaf_message_uuid"))
+	if leafIdx != -1 {
+		str, _ := v8.ParseV8String(bestVal, leafIdx+len("current_leaf_message_uuid"))
+		if conversationUUIDPattern.MatchString(str) {
+			detail.Summary.CurrentLeaf = str
+		}
+	}
+	if detail.Summary.CurrentLeaf == "" {
+		leafIdx := bytes.Index(bestVal, []byte("current_leaf_message_uuid\"$"))
+		if leafIdx != -1 && leafIdx+27+36 <= len(bestVal) {
+			cand := string(bestVal[leafIdx+27 : leafIdx+27+36])
+			if conversationUUIDPattern.MatchString(cand) {
+				detail.Summary.CurrentLeaf = cand
+			}
+		}
 	}
 
 	// Extract Artifacts
@@ -214,6 +239,11 @@ func GetConversationDetail(profilePath string, targetUUID string) (*Conversation
 	msgs, err := extractMessagesWithBranch(bestVal, detail.Summary.CurrentLeaf)
 	if err != nil {
 		return nil, err
+	}
+	for _, m := range msgs {
+		if !utf8.ValidString(m.Text) {
+			return nil, fmt.Errorf("tin nhắn %s chứa chuỗi không phải UTF-8 hợp lệ", m.UUID)
+		}
 	}
 	detail.Messages = msgs
 
@@ -264,11 +294,95 @@ func extractArtifacts(data []byte) []Artifact {
 	return res
 }
 
+func findMessageUUID(window []byte) (string, int) {
+	searchEnd := len(window)
+	for searchEnd > 0 {
+		uIdx := bytes.LastIndex(window[:searchEnd], []byte("uuid\"$"))
+		if uIdx < 0 {
+			break
+		}
+		if uIdx >= 15 && bytes.Equal(window[uIdx-15:uIdx], []byte("parent_message_")) {
+			searchEnd = uIdx
+			continue
+		}
+		uActual := uIdx + len("uuid\"$")
+		if uActual+36 <= len(window) {
+			cand := string(window[uActual : uActual+36])
+			if conversationUUIDPattern.MatchString(cand) {
+				return cand, uIdx
+			}
+		}
+		searchEnd = uIdx
+	}
+	searchEnd = len(window)
+	for searchEnd > 0 {
+		uIdx := bytes.LastIndex(window[:searchEnd], []byte("uuid\""))
+		if uIdx < 0 {
+			break
+		}
+		if uIdx >= 15 && bytes.Equal(window[uIdx-15:uIdx], []byte("parent_message_")) {
+			searchEnd = uIdx
+			continue
+		}
+		str, _ := v8.ParseV8String(window, uIdx+len("uuid\""))
+		if conversationUUIDPattern.MatchString(str) {
+			return str, uIdx
+		}
+		searchEnd = uIdx
+	}
+	return "", -1
+}
+
+func extractMessageText(data []byte) string {
+	var textParts []string
+
+	for offset := 0; offset < len(data); {
+		pos := bytes.Index(data[offset:], []byte("text"))
+		if pos == -1 {
+			break
+		}
+		actual := offset + pos
+		offset = actual + 4
+
+		matched := false
+		if actual+4 < len(data) {
+			tag := data[actual+4]
+			if tag == '"' || tag == 'c' {
+				str, nextPos := v8.ParseV8String(data, actual+4)
+				if len(str) > 0 && str != "text" && str != "content" {
+					textParts = append(textParts, str)
+					if nextPos > offset {
+						offset = nextPos
+					}
+					matched = true
+				}
+			}
+		}
+
+		if !matched {
+			for p := actual + 4; p < len(data) && p < actual+8; p++ {
+				if data[p] == '"' || data[p] == 'c' {
+					str, nextPos := v8.ParseV8String(data, p)
+					if len(str) > 0 && str != "text" && str != "content" {
+						textParts = append(textParts, str)
+						if nextPos > offset {
+							offset = nextPos
+						}
+						break
+					}
+				}
+			}
+		}
+	}
+
+	return strings.Join(textParts, "\n\n")
+}
+
 func extractMessagesWithBranch(data []byte, currentLeaf string) ([]Message, error) {
 	var allMessages []Message
 	needle := []byte("sender\"")
+	var senderPositions []int
 	idx := 0
-	prevSenderPos := 0
 
 	for {
 		pos := bytes.Index(data[idx:], needle)
@@ -276,15 +390,26 @@ func extractMessagesWithBranch(data []byte, currentLeaf string) ([]Message, erro
 			break
 		}
 		actual := idx + pos
+		senderPositions = append(senderPositions, actual)
 		idx = actual + len(needle)
+	}
 
+	prevSenderPos := 0
+
+	for i, actual := range senderPositions {
 		sender := ""
-		if actual+len(needle)+5 <= len(data) {
-			tail := data[actual+len(needle):]
-			if bytes.HasPrefix(tail, []byte("\x05human")) || bytes.HasPrefix(tail, []byte("human")) {
+		tail := data[actual+len(needle):]
+		if len(tail) >= 5 {
+			if bytes.HasPrefix(tail, []byte("\x05human")) || bytes.HasPrefix(tail, []byte("\"human")) || bytes.HasPrefix(tail, []byte("human")) {
 				sender = "human"
-			} else if bytes.HasPrefix(tail, []byte("	assistant")) || bytes.HasPrefix(tail, []byte("assistant")) {
+			} else if bytes.HasPrefix(tail, []byte("	assistant")) || bytes.HasPrefix(tail, []byte("\"assistant")) || bytes.HasPrefix(tail, []byte("assistant")) {
 				sender = "assistant"
+			}
+		}
+		if sender == "" {
+			str, _ := v8.ParseV8String(data, actual+len(needle))
+			if str == "human" || str == "assistant" {
+				sender = str
 			}
 		}
 
@@ -292,57 +417,56 @@ func extractMessagesWithBranch(data []byte, currentLeaf string) ([]Message, erro
 			continue
 		}
 
-		// The window for this message strictly starts after the previous sender
-		startWindow := prevSenderPos
-		if actual-65536 > startWindow {
-			startWindow = actual - 65536
-		}
-		window := data[startWindow:actual]
+		window := data[prevSenderPos:actual]
 		prevSenderPos = actual + len(needle)
 
 		// Find Message UUID
-		var msgUUID string
-		uIdx := bytes.LastIndex(window, []byte("uuid\"$"))
-		if uIdx != -1 && uIdx+6+36 <= len(window) {
-			msgUUID = string(window[uIdx+6 : uIdx+6+36])
-		}
+		msgUUID, uPos := findMessageUUID(window)
 
-		// Find Parent Message UUID (look forward around sender)
+		// Find Parent Message UUID (search forward around sender)
 		var parentUUID string
-		forwardLen := 300
-		if actual+forwardLen > len(data) {
+		forwardLen := 1000
+		if i+1 < len(senderPositions) {
+			forwardLen = senderPositions[i+1] - actual
+		} else if actual+forwardLen > len(data) {
 			forwardLen = len(data) - actual
 		}
 		forwardWindow := data[actual : actual+forwardLen]
-		pIdx := bytes.Index(forwardWindow, []byte("parent_message_uuid\"$"))
-		if pIdx != -1 && pIdx+21+36 <= len(forwardWindow) {
-			parentUUID = string(forwardWindow[pIdx+21 : pIdx+21+36])
-		}
 
-		// Find text
-		typeIdx := bytes.LastIndex(window, []byte("type\"\x04text"))
-		if typeIdx == -1 {
-			typeIdx = bytes.LastIndex(window, []byte("type\"text"))
-		}
-
-		var text string
-		if typeIdx != -1 {
-			sub := window[:typeIdx]
-			textKeyIdx := bytes.LastIndex(sub, []byte("\x04text"))
-			if textKeyIdx == -1 {
-				textKeyIdx = bytes.LastIndex(sub, []byte("text\""))
-			}
-			if textKeyIdx != -1 {
-				parsed, _ := v8.ParseV8String(sub, textKeyIdx+5)
-				text = strings.TrimSpace(parsed)
+		pNeedle := []byte("parent_message_uuid\"$")
+		pIdx := bytes.Index(forwardWindow, pNeedle)
+		if pIdx != -1 && pIdx+len(pNeedle)+36 <= len(forwardWindow) {
+			cand := string(forwardWindow[pIdx+len(pNeedle) : pIdx+len(pNeedle)+36])
+			if conversationUUIDPattern.MatchString(cand) || strings.HasPrefix(cand, "00000000") {
+				parentUUID = cand
 			}
 		}
+		if parentUUID == "" {
+			pNeedle2 := []byte("parent_message_uuid\"")
+			pIdx2 := bytes.Index(forwardWindow, pNeedle2)
+			if pIdx2 != -1 {
+				str, _ := v8.ParseV8String(forwardWindow, pIdx2+len(pNeedle2))
+				if conversationUUIDPattern.MatchString(str) || strings.HasPrefix(str, "00000000") {
+					parentUUID = str
+				}
+			}
+		}
+
+		// Extract text
+		contentWindow := window
+		if uPos != -1 {
+			contentWindow = window[uPos:]
+		}
+		text := extractMessageText(contentWindow)
 
 		if text == "" {
 			text = cleanPrintableText(string(window))
 		}
+		if !utf8.ValidString(text) {
+			text = strings.ToValidUTF8(text, "")
+		}
 
-		if len(text) > 3 {
+		if len(text) > 0 || msgUUID != "" {
 			allMessages = append(allMessages, Message{
 				UUID:       msgUUID,
 				ParentUUID: parentUUID,
@@ -419,13 +543,20 @@ func extractMessagesWithBranch(data []byte, currentLeaf string) ([]Message, erro
 func cleanPrintableText(s string) string {
 	var b strings.Builder
 	for _, r := range s {
-		if r >= 32 && r <= 126 || r == '\n' || r == '\t' || r > 127 {
+		if r == utf8.RuneError {
+			continue
+		}
+		if r >= 32 && r <= 126 || r == '\n' || r == '	' || r > 127 {
 			b.WriteRune(r)
 		}
 	}
 	res := b.String()
 	if len(res) > 20000 {
-		res = res[:20000]
+		cut := 20000
+		for cut > 0 && !utf8.RuneStart(res[cut]) {
+			cut--
+		}
+		res = res[:cut]
 	}
 	return strings.TrimSpace(res)
 }

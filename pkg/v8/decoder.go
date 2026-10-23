@@ -8,6 +8,14 @@ import (
 	"claude-switch/pkg/leveldb"
 )
 
+func DecodeLatin1(b []byte) string {
+	runes := make([]rune, len(b))
+	for i, c := range b {
+		runes[i] = rune(c)
+	}
+	return string(runes)
+}
+
 func DecodeUTF16LE(b []byte) string {
 	if len(b) < 2 {
 		return ""
@@ -38,7 +46,7 @@ func ParseV8String(val []byte, startPos int) (string, int) {
 		consumed := int(reader.Size()) - reader.Len()
 		end := pos + 1 + consumed + int(l)
 		if end <= len(val) {
-			str := string(val[pos+1+consumed : end])
+			str := DecodeLatin1(val[pos+1+consumed : end])
 			return str, end
 		}
 	} else if tag == 'c' { // TwoByteString (UTF-16LE)

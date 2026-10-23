@@ -9,18 +9,18 @@ import (
 
 func buildSyntheticMessage(uuid, parentUUID, sender, text string) []byte {
 	var buf bytes.Buffer
-	buf.WriteString(fmt.Sprintf(`uuid"$%s"`, uuid))
-	buf.WriteString(`type"text"`)
+	buf.WriteString(fmt.Sprintf(`uuid"$%s`, uuid))
+	buf.WriteString("type\"\x04text")
 	buf.WriteString("\x04text\"")
 	buf.WriteByte(byte(len(text)))
 	buf.WriteString(text)
 	if sender == "human" {
-		buf.WriteString("sender\"\x05human\"")
+		buf.WriteString("sender\"\x05human")
 	} else {
-		buf.WriteString("sender\"\tassistant\"")
+		buf.WriteString("sender\"	assistant")
 	}
 	if parentUUID != "" {
-		buf.WriteString(fmt.Sprintf(`parent_message_uuid"$%s"`, parentUUID))
+		buf.WriteString(fmt.Sprintf(`parent_message_uuid"$%s`, parentUUID))
 	}
 	return buf.Bytes()
 }

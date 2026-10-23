@@ -2,6 +2,7 @@ package v8
 
 import (
 	"testing"
+	"unicode/utf8"
 )
 
 func TestDecodeUTF16LE(t *testing.T) {
@@ -33,5 +34,27 @@ func TestDecodeUTF16LE(t *testing.T) {
 	expected := "Tiếng Việt"
 	if res != expected {
 		t.Errorf("got %q, want %q", res, expected)
+	}
+}
+
+func TestParseV8StringLatin1(t *testing.T) {
+	// OneByteString tag '"' with Latin-1 byte 0xe9 ('é') and 0xa7 ('§')
+	// e.g. "café §6.1"
+	// Length = 9 bytes
+	raw := []byte{
+		'"', 9,
+		'c', 'a', 'f', 0xe9, ' ', 0xa7, '6', '.', '1',
+	}
+
+	str, end := ParseV8String(raw, 0)
+	if end != len(raw) {
+		t.Errorf("expected end %d, got %d", len(raw), end)
+	}
+	expected := "café §6.1"
+	if str != expected {
+		t.Errorf("got %q, want %q", str, expected)
+	}
+	if !utf8.ValidString(str) {
+		t.Errorf("decoded string %q is not valid UTF-8", str)
 	}
 }
